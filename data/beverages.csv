@@ -1,0 +1,9 @@
+id,name,brand,category,sugar_free,caffeine,color_dark,citrus_note,gas_level
+coca_classic,Coca-Cola Classica,Coca-Cola,Cola,0,1,1,0,3
+coca_zero,Coca-Cola Zero,Coca-Cola,Cola,1,1,1,0,3
+pepsi_classic,Pepsi Classica,Pepsi,Cola,0,1,1,1,3
+pepsi_zero,Pepsi Zero,Pepsi,Cola,1,1,1,1,3
+chinotto,Chinotto,Neri,Bitter,0,0,1,1,2
+cedrata,Cedrata,Tassoni,Citrus,0,0,0,1,2
+fanta,Fanta Aranciata,The Coca-Cola Company,Citrus,0,0,0,1,3
+sprite,Sprite,The Coca-Cola Company,Citrus,0,0,0,1,3
