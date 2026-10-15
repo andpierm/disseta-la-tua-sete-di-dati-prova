@@ -1,6 +1,6 @@
 # ==============================================================================
 # DISSETA LA TUA SETE DI DATI - Maker Faire 2026
-# App Shiny con Salvataggio Locale CSV, 17 Bevande e Metadati DEI + Stile di Vita
+# Risposte salvate su Google Sheets (se non disponibile, su CSV locale)
 # ==============================================================================
 
 library(shiny)
@@ -8,179 +8,388 @@ library(shinyjs)
 library(ape)
 library(ggtree)
 library(ggplot2)
-library(dplyr)
 library(pROC)
 library(randomForest)
-library(bslib)
+library(googlesheets4)
 
 set.seed(123)
 
-# --- 1. CONFIGURAZIONE SALVATAGGIO LOCALE CSV ---
-CSV_FILE <- "risposte_bevande.csv"
+# --- 1. CONFIGURAZIONE -------------------------------------------------------
+GS_SHEET_ID   <- "1HeKjUeP7e5qMwePfYOc9K3XOZqaW7lKCg1mUJMl7xR0"
+GS_TAB        <- "risposte"               # nome della scheda nel foglio
+CSV_FILE      <- "risposte_bevande.csv"   # usato solo se Google Sheets non è disponibile
+PIN_OPERATORE <- "2026"                   # PIN della scheda operatore: cambialo prima dell'evento
 
-salva_risposta_csv <- function(data_row, filename = CSV_FILE) {
+# Ordine colonne: deve coincidere con la prima riga (intestazioni) del foglio
+COLONNE <- c("timestamp", "nickname", "eta", "genere", "freq", "fortuna",
+             "maratona_ny", "sabato_sera", "turno", "modalita",
+             "bevanda_giusta", "bevanda_scelta", "scelta", "corretto", "id_partita", "lista")
+
+# Chiave del service account, in ordine di priorità:
+#  1) variabile d'ambiente GS_SERVICE_ACCOUNT_JSON (su shinyapps.io: contenuto del JSON)
+#  2) file .json dentro la cartella .secrets/ del progetto (sul tuo computer)
+trova_chiave <- function() {
+  env <- Sys.getenv("GS_SERVICE_ACCOUNT_JSON")
+  if (nzchar(env)) return(env)
+  archivi <- list.files(".secrets", full.names = TRUE)
+  json <- archivi[grepl("\\.json$", archivi, ignore.case = TRUE)]
+  if (length(json) > 0) return(json[1])
+  ""
+}
+
+GS_KEY <- trova_chiave()
+USE_GS <- nzchar(GS_KEY) && nzchar(GS_SHEET_ID)
+
+if (USE_GS) {
   tryCatch({
-    file_exists <- file.exists(filename)
-    write.table(
-      data_row,
-      file = filename,
-      append = TRUE,
-      sep = ",",
-      dec = ".",
-      row.names = FALSE,
-      col.names = !file_exists,
-      qmethod = "double"
-    )
+    if (grepl("^\\s*\\{", GS_KEY)) {
+      tmp_json <- tempfile(fileext = ".json")
+      writeLines(GS_KEY, tmp_json)
+      gs4_auth(path = tmp_json)
+    } else {
+      gs4_auth(path = GS_KEY)
+    }
+    message("Salvataggio: Google Sheets attivo")
   }, error = function(e) {
-    message("Errore durante il salvataggio sul file CSV locale: ", e$message)
+    USE_GS <<- FALSE
+    message("Autenticazione Google non riuscita, uso il CSV locale: ", e$message)
+  })
+} else {
+  message("Salvataggio: Google Sheets non configurato, uso il CSV locale")
+}
+
+STATO_SALVATAGGIO <- if (USE_GS) "Google Sheets ✅" else "CSV locale ⚠️ (Google Sheets non configurato)"
+
+# Scrive una riga. Restituisce NULL se è andata bene, altrimenti il messaggio d'errore.
+salva_risposta <- function(riga) {
+  tryCatch({
+    riga <- riga[, COLONNE, drop = FALSE]
+    if (USE_GS) {
+      googlesheets4::sheet_append(GS_SHEET_ID, data = riga, sheet = GS_TAB)
+    } else {
+      scrivi_csv_locale(riga)
+    }
+    NULL
+  }, error = function(e) {
+    message("Errore salvataggio: ", e$message)
+    e$message
   })
 }
 
-# --- 2. ALBERO TASSONOMICO ESTESO ---
+scrivi_csv_locale <- function(riga) {
+  if (file.exists(CSV_FILE)) {
+    intestazione <- tryCatch(names(read.csv(CSV_FILE, nrows = 1, stringsAsFactors = FALSE)),
+                             error = function(e) character(0))
+    if (!identical(intestazione, COLONNE)) {
+      # intestazione diversa (file di una versione precedente): lo conservo come backup
+      file.rename(CSV_FILE, paste0("backup_", format(Sys.time(), "%Y%m%d%H%M%S"), "_", CSV_FILE))
+    }
+  }
+  esiste <- file.exists(CSV_FILE)
+  write.table(riga, file = CSV_FILE, append = esiste, sep = ",", dec = ".",
+              row.names = FALSE, col.names = !esiste, qmethod = "double")
+}
+
+risposte_vuote <- function() {
+  data.frame(
+    timestamp = character(), nickname = character(), eta = numeric(),
+    genere = character(), freq = numeric(), fortuna = character(),
+    maratona_ny = character(), sabato_sera = character(), turno = numeric(),
+    modalita = character(), bevanda_giusta = character(), bevanda_scelta = character(),
+    scelta = character(), corretto = logical(), id_partita = character(),
+    lista = character(), stringsAsFactors = FALSE
+  )
+}
+
+pulisci_risposte <- function(grezzo) {
+  df <- as.data.frame(grezzo, stringsAsFactors = FALSE)
+  for (col in COLONNE) if (!col %in% names(df)) df[[col]] <- NA_character_
+  df <- df[, COLONNE, drop = FALSE]
+  df$eta      <- suppressWarnings(as.numeric(df$eta))
+  df$freq     <- suppressWarnings(as.numeric(df$freq))
+  df$turno    <- suppressWarnings(as.numeric(df$turno))
+  df$corretto <- toupper(as.character(df$corretto)) %in% c("TRUE", "T", "1")
+  rownames(df) <- NULL
+  df
+}
+
+# Rilegge tutte le risposte (da Google Sheets o dal CSV locale)
+leggi_risposte <- function() {
+  tryCatch({
+    grezzo <- if (USE_GS) {
+      googlesheets4::read_sheet(GS_SHEET_ID, sheet = GS_TAB, col_types = "c")
+    } else if (file.exists(CSV_FILE)) {
+      read.csv(CSV_FILE, colClasses = "character", stringsAsFactors = FALSE)
+    } else {
+      NULL
+    }
+    dati <- if (is.null(grezzo) || nrow(grezzo) == 0) risposte_vuote() else pulisci_risposte(grezzo)
+    list(dati = dati, errore = NULL)
+  }, error = function(e) {
+    message("Lettura risposte non riuscita: ", e$message)
+    list(dati = risposte_vuote(), errore = e$message)
+  })
+}
+
+# --- 2. ALBERO TASSONOMICO ---------------------------------------------------
 beverage_tree_newick <- "((((coca_classic:1,coca_zero:1)Coca:1,(pepsi_classic:1,(coop_cola:1,conad_cola:1)StoreCola:1)PepsiOther:1)Cola:1,(chinotto:1,molecola:1)DarkBitter:1)DarkDrinks:1,(((fanta:1,fanta_zero:1)Fanta:1,conad_orange:1)Orange:1,(sprite:1,cedrata:1)ClearCitrus:1)Citrus:1,((estathe_limone:1,estathe_pesca:1)Estathe:1,sanbenedetto_te:1)Tea:1,(gatorade:1,powerade:1)Sports:1)Bibite;"
 
 tree <- tryCatch(ape::read.tree(text = beverage_tree_newick), error = function(e) NULL)
 
-# --- 3. DATABASE BEVANDE ---
-beverages_df <- data.frame(
-  id = c("coca_classic", "coca_zero", "pepsi_classic", "coop_cola", "conad_cola", 
-         "chinotto", "molecola", "fanta", "fanta_zero", "conad_orange", 
-         "sprite", "cedrata", "estathe_limone", "estathe_pesca", "sanbenedetto_te", 
+# --- 3. BEVANDE --------------------------------------------------------------
+# image: nome del file dentro la cartella www/ (controlla maiuscole ed estensione)
+bevande <- data.frame(
+  id = c("coca_classic", "coca_zero", "pepsi_classic", "coop_cola", "conad_cola",
+         "chinotto", "molecola", "fanta", "fanta_zero", "conad_orange",
+         "sprite", "cedrata", "estathe_limone", "estathe_pesca", "sanbenedetto_te",
          "gatorade", "powerade"),
-  
-  name = c("Coca-Cola Classica", "Coca-Cola Zero", "Pepsi Classica", "Coop Cola", "Conad Cola", 
-           "Chinotto Sanpellegrino", "MoleCola", "Fanta Aranciata", "Fanta Zero", "Aranciata Conad", 
-           "Sprite", "Cedrata Tassoni", "Estathé Limone", "Estathé Pesca", "Tè San Benedetto", 
+  name = c("Coca-Cola Classica", "Coca-Cola Zero", "Pepsi Classica", "Coop Cola", "Conad Cola Zero",
+           "Chinotto Sanpellegrino", "MoleCola", "Fanta Aranciata", "Fanta Zero", "Aranciata Conad",
+           "Sprite", "Cedrata Tassoni", "Estathé Limone", "Estathé Pesca", "Tè San Benedetto",
            "Gatorade", "Powerade"),
-  
-  tree_name = c("coca_classic", "coca_zero", "pepsi_classic", "coop_cola", "conad_cola", 
-                "chinotto", "molecola", "fanta", "fanta_zero", "conad_orange", 
-                "sprite", "cedrata", "estathe_limone", "estathe_pesca", "sanbenedetto_te", 
-                "gatorade", "powerade"),
-  
-  group = c("Cola", "Cola", "Cola", "Cola", "Cola", 
-            "DarkBitter", "Cola", "Citrus", "Citrus", "Citrus", 
-            "Citrus", "Citrus", "Tea", "Tea", "Tea", 
-            "Sports", "Sports"),
-  
-  color_look = c("Nera", "Nera", "Nera", "Nera", "Nera", 
-                 "Nera", "Nera", "Arancione", "Arancione", "Arancione", 
-                 "Trasparente", "Gialla", "Marrone", "Marrone", "Marrone", 
-                 "Blu", "Blu"),
-  
-  image_url = c(
-    "coca_classic.jpg",
-    "coca_zero.jpg",
-    "pepsi_classic.jpg",
-    "coop_cola.jpg",
-    "conad_cola.jpg",
-    "chinotto.jpg",
-    "molecola.jpg",
-    "fanta.jpg",
-    "fanta_zero.jpg",
-    "conad_orange.jpeg",
-    "sprite.jpg",
-    "cedrata.jpg",
-    "estathe_limone.jpg",
-    "estathe_pesca.jpeg",
-    "sanbenedetto_te.jpg",
-    "gatorade.png",
-    "powerade.jpg"
-  ),
-  
+  image = c("coca_classic.jpg", "coca_zero.jpg", "pepsi_classic.jpg", "coop_cola.jpg", "conad_cola.jpg",
+            "chinotto.png", "molecola.jpg", "fanta.jpg", "fanta_zero.png", "conad_orange.jpeg",
+            "sprite.jpg", "cedrata.jpg", "estathe_limone.jpg", "estathe_pesca.jpeg", "sanbenedetto_te.jpg",
+            "gatorade.png", "powerade.jpg"),
   stringsAsFactors = FALSE
 )
 
-safe_sample <- function(x, size = 1) {
-  if (length(x) == 0) return(NULL)
-  if (length(x) == 1) return(x)
-  sample(x, size)
+nome_bev     <- function(id) bevande$name[match(id, bevande$id)]
+immagine_bev <- function(id) bevande$image[match(id, bevande$id)]
+
+# Bicchiere neutro (vuoto, senza bevanda): incorporato nel codice, non serve un file in www/
+BICCHIERE_NEUTRO <- paste0(
+  "data:image/svg+xml;utf8,",
+  "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 300 400'>",
+  "<path d='M70 60 L230 60 L210 350 Q208 370 188 370 L112 370 Q92 370 90 350 Z' ",
+  "fill='whitesmoke' stroke='darkgray' stroke-width='6' stroke-linejoin='round'/>",
+  "<ellipse cx='150' cy='60' rx='80' ry='10' fill='gainsboro' stroke='darkgray' stroke-width='5'/>",
+  "<path d='M95 110 L110 320' stroke='white' stroke-width='10' stroke-linecap='round' opacity='0.8'/>",
+  "</svg>"
+)
+
+# --- 4. LISTE DI DOMANDE -----------------------------------------------------
+# Ci sono 3 liste: a ogni partita ne viene estratta una a caso.
+# Ogni lista ha 10 livelli, dal più facile (1) al più difficile (10).
+# Ogni livello contiene:
+#   coppia  -> 2 bicchieri (blind test): A e B
+#   chiedi  -> quale dei due va riconosciuto (1 = A, 2 = B)
+#   terna   -> 3 bicchieri (trova l'intruso): A, B e C
+#   intruso -> quale dei tre è l'intruso (1 = A, 2 = B, 3 = C)
+# Le posizioni sono fisse: la scheda operatore le riporta esattamente così.
+livello <- function(coppia, chiedi, terna, intruso) {
+  list(coppia = coppia, chiedi = chiedi, terna = terna, intruso = intruso)
 }
 
-# --- GENERATORE TURNO 3 BICCHIERI (INTRUSO) ---
-generate_turn_3 <- function(turn_num, tree, beverages_df) {
-  if (turn_num <= 5) {
-    easy_sets <- list(
-      c("coca_classic", "pepsi_classic", "fanta"),
-      c("coca_classic", "pepsi_classic", "estathe_limone"),
-      c("estathe_limone", "sanbenedetto_te", "pepsi_classic"),
-      c("fanta", "sprite", "coca_classic"),
-      c("gatorade", "powerade", "cedrata")
-    )
-    idx <- ((turn_num - 1) %% length(easy_sets)) + 1
-    chosen <- easy_sets[[idx]]
-    focal <- chosen[1]
-    similar <- chosen[2]
-    intruder <- chosen[3]
-  } else {
-    hard_sets <- list(
-      c("coca_classic", "molecola", "chinotto"),
-      c("coca_classic", "coop_cola", "conad_cola"),
-      c("fanta", "fanta_zero", "conad_orange"),
-      c("estathe_limone", "estathe_pesca", "sanbenedetto_te"),
-      c("chinotto", "molecola", "coop_cola")
-    )
-    idx <- ((turn_num - 6) %% length(hard_sets)) + 1
-    chosen <- hard_sets[[idx]]
-    focal <- chosen[1]
-    similar <- chosen[2]
-    intruder <- chosen[3]
-  }
+LISTE <- list(
   
-  species_raw <- sample(c(focal, similar, intruder))
-  urls <- beverages_df$image_url[match(species_raw, beverages_df$tree_name)]
-  names_clean <- beverages_df$name[match(species_raw, beverages_df$tree_name)]
-  
+  # ---- LISTA 1 ----
   list(
-    num_choices = 3,
-    species_raw = species_raw,
-    species = names_clean,
-    intruder = which(species_raw == intruder),
-    urls = urls,
-    turn = turn_num
-  )
-}
-
-# --- GENERATORE TURNO 2 BICCHIERI (ASSAGGIO ALLA CIECA) ---
-generate_turn_2 <- function(turn_num, beverages_df) {
-  if (turn_num <= 5) {
-    easy_pairs <- list(
-      c("coca_classic", "fanta"),
-      c("pepsi_classic", "estathe_limone"),
-      c("sprite", "chinotto"),
-      c("cedrata", "coca_classic"),
-      c("gatorade", "fanta")
-    )
-    idx <- ((turn_num - 1) %% length(easy_pairs)) + 1
-    pair <- easy_pairs[[idx]]
-  } else {
-    hard_pairs <- list(
-      c("coca_classic", "chinotto"),
-      c("fanta", "conad_orange"),
-      c("estathe_limone", "sanbenedetto_te"),
-      c("coca_classic", "molecola"),
-      c("chinotto", "coop_cola")
-    )
-    idx <- ((turn_num - 6) %% length(hard_pairs)) + 1
-    pair <- hard_pairs[[idx]]
-  }
+    livello(c("coca_classic", "fanta"), 1, c("coca_classic", "pepsi_classic", "fanta"), 3),            # 1 facile
+    livello(c("chinotto", "sprite"), 1, c("coca_classic", "sprite", "fanta"), 1),                     # 2 facile
+    livello(c("cedrata", "gatorade"), 1, c("estathe_limone", "pepsi_classic", "sanbenedetto_te"), 2), # 3 medio-facile
+    livello(c("chinotto", "coca_classic"), 2, c("fanta", "sprite", "cedrata"), 1),                    # 4 medio
+    livello(c("fanta", "conad_orange"), 1, c("coca_zero", "coca_classic", "sprite"), 3),              # 5 medio
+    livello(c("coca_classic", "pepsi_classic"), 2, c("coop_cola", "chinotto", "coca_classic"), 2),    # 6 medio-difficile
+    livello(c("pepsi_classic", "coca_zero"), 2, c("fanta", "fanta_zero", "conad_orange"), 3),         # 7 difficile
+    livello(c("estathe_limone", "estathe_pesca"), 2, c("sanbenedetto_te", "estathe_limone", "estathe_pesca"), 1), # 8 difficile
+    livello(c("powerade", "gatorade"), 1, c("coop_cola", "chinotto", "conad_cola"), 2),               # 9 difficile: stesso colore
+    livello(c("coop_cola", "conad_cola"), 2, c("gatorade", "powerade", "cedrata"), 3)                 # 10 il più difficile
+  ),
   
-  pair <- sample(pair)
-  correct_idx <- sample(1:2, 1)
-  urls <- beverages_df$image_url[match(pair, beverages_df$tree_name)]
-  names_clean <- beverages_df$name[match(pair, beverages_df$tree_name)]
-  
+  # ---- LISTA 2 ----
   list(
-    num_choices = 2,
-    species_raw = pair,
-    species = names_clean,
-    target_idx = correct_idx,
-    urls = urls,
-    turn = turn_num
+    livello(c("fanta", "chinotto"), 1, c("coca_classic", "pepsi_classic", "estathe_limone"), 3),      # 1 facile
+    livello(c("coca_zero", "sprite"), 1, c("fanta", "conad_orange", "chinotto"), 3),                  # 2 facile
+    livello(c("sanbenedetto_te", "pepsi_classic"), 1, c("coca_classic", "estathe_pesca", "sanbenedetto_te"), 1), # 3 medio-facile
+    livello(c("fanta_zero", "cedrata"), 2, c("sprite", "cedrata", "fanta_zero"), 3),                  # 4 medio
+    livello(c("coop_cola", "pepsi_classic"), 1, c("coop_cola", "fanta", "conad_cola"), 2),            # 5 medio
+    livello(c("coca_zero", "chinotto"), 2, c("chinotto", "coca_zero", "coca_classic"), 1),            # 6 medio-difficile
+    livello(c("cedrata", "sprite"), 2, c("conad_orange", "fanta", "fanta_zero"), 2),                  # 7 difficile
+    livello(c("conad_orange", "fanta_zero"), 1, c("estathe_limone", "sanbenedetto_te", "estathe_pesca"), 3), # 8 difficile
+    livello(c("sanbenedetto_te", "estathe_limone"), 2, c("conad_cola", "coca_zero", "coca_classic"), 1),    # 9 difficile
+    livello(c("coca_classic", "conad_cola"), 2, c("coop_cola", "pepsi_classic", "conad_cola"), 2)     # 10 il più difficile
+  ),
+  
+  # ---- LISTA 3 ----
+  list(
+    livello(c("coca_classic", "sprite"), 1, c("coca_classic", "sprite", "cedrata"), 1),               # 1 facile
+    livello(c("sanbenedetto_te", "fanta"), 1, c("conad_orange", "fanta", "sanbenedetto_te"), 3),      # 2 facile
+    livello(c("coca_zero", "estathe_pesca"), 2, c("estathe_limone", "coca_zero", "sanbenedetto_te"), 2), # 3 medio-facile
+    livello(c("fanta", "sprite"), 1, c("cedrata", "fanta", "sprite"), 1),                             # 4 medio
+    livello(c("conad_cola", "pepsi_classic"), 1, c("fanta_zero", "pepsi_classic", "conad_cola"), 1),  # 5 medio
+    livello(c("pepsi_classic", "chinotto"), 2, c("coca_zero", "coca_classic", "pepsi_classic"), 3),   # 6 medio-difficile
+    livello(c("fanta", "fanta_zero"), 2, c("conad_orange", "fanta_zero", "fanta"), 2),                # 7 difficile
+    livello(c("estathe_pesca", "sanbenedetto_te"), 2, c("estathe_limone", "estathe_pesca", "sanbenedetto_te"), 1), # 8 difficile
+    livello(c("coop_cola", "conad_cola"), 1, c("conad_cola", "coca_zero", "coop_cola"), 2),           # 9 difficile
+    livello(c("powerade", "gatorade"), 2, c("coca_zero", "pepsi_classic", "conad_cola"), 3)           # 10 il più difficile
   )
+)
+
+# Controllo delle liste all'avvio: segnala nel terminale eventuali errori di scrittura
+valida_liste <- function() {
+  problemi <- character(0)
+  for (l in seq_along(LISTE)) {
+    if (length(LISTE[[l]]) != 10) {
+      problemi <- c(problemi, paste("Lista", l, "non ha 10 domande"))
+    }
+    for (k in seq_along(LISTE[[l]])) {
+      lv <- LISTE[[l]][[k]]
+      if (!all(c(lv$coppia, lv$terna) %in% bevande$id)) {
+        problemi <- c(problemi, paste("Lista", l, "domanda", k, ": nome bevanda sbagliato"))
+      }
+      if (length(unique(lv$coppia)) != 2 || length(unique(lv$terna)) != 3) {
+        problemi <- c(problemi, paste("Lista", l, "domanda", k, ": bevande ripetute"))
+      }
+    }
+  }
+  if (length(problemi) > 0) message("ATTENZIONE liste domande:\n", paste(problemi, collapse = "\n"))
+  invisible(problemi)
+}
+valida_liste()
+
+scegli_modalita <- function(mode) {
+  if (mode == "mix") sample(c(2, 3), 1) else as.numeric(mode)
 }
 
-# --- 4. INTERFACCIA UTENTE (UI) ---
+# Restituisce le bevande del turno nell'ordine fisso dei bicchieri A, B, C
+genera_turno <- function(turno, modalita, lista) {
+  lv <- LISTE[[lista]][[turno]]
+  if (modalita == 3) {
+    list(modalita = 3, lista = lista, turno = turno, ids = lv$terna,
+         correct_idx = lv$intruso, target = NULL)
+  } else {
+    list(modalita = 2, lista = lista, turno = turno, ids = lv$coppia,
+         correct_idx = lv$chiedi, target = nome_bev(lv$coppia[lv$chiedi]))
+  }
+}
+
+# Scheda operatore: per ogni lista e domanda, i bicchieri da preparare
+tabella_scheda_operatore <- function() {
+  righe <- list()
+  for (l in seq_along(LISTE)) {
+    for (k in seq_along(LISTE[[l]])) {
+      lv <- LISTE[[l]][[k]]
+      righe[[length(righe) + 1]] <- data.frame(
+        Lista = l, Domanda = k, Bicchieri = 2,
+        "Bicchiere A" = nome_bev(lv$coppia[1]),
+        "Bicchiere B" = nome_bev(lv$coppia[2]),
+        "Bicchiere C" = "-",
+        "Risposta corretta" = paste0(LETTERS[lv$chiedi], ": ", nome_bev(lv$coppia[lv$chiedi])),
+        check.names = FALSE, stringsAsFactors = FALSE
+      )
+      righe[[length(righe) + 1]] <- data.frame(
+        Lista = l, Domanda = k, Bicchieri = 3,
+        "Bicchiere A" = nome_bev(lv$terna[1]),
+        "Bicchiere B" = nome_bev(lv$terna[2]),
+        "Bicchiere C" = nome_bev(lv$terna[3]),
+        "Risposta corretta" = paste0("intruso ", LETTERS[lv$intruso], ": ", nome_bev(lv$terna[lv$intruso])),
+        check.names = FALSE, stringsAsFactors = FALSE
+      )
+    }
+  }
+  do.call(rbind, righe)
+}
+
+# --- 5. GRAFICO ALBERO -------------------------------------------------------
+# esito: vettore con nomi (id bevanda) -> "verde" (corretta) o "rosso" (errata)
+colore_tip <- function(esito, id) {
+  e <- esito[id]
+  if (is.na(e)) "#6c757d" else if (e == "verde") "#28a745" else "#dc3545"
+}
+
+plot_albero <- function(visti, esito, size = 5.5) {
+  tips <- intersect(tree$tip.label, visti)
+  if (length(tips) < 2) tips <- tree$tip.label
+  sub <- ape::keep.tip(tree, tips)
+  
+  dati <- data.frame(
+    label = sub$tip.label,
+    clean = nome_bev(sub$tip.label),
+    color = unname(vapply(sub$tip.label, function(id) colore_tip(esito, id), character(1))),
+    stringsAsFactors = FALSE
+  )
+  
+  grafico <- ggtree(sub, size = 1.2) %<+% dati +
+    geom_tiplab(aes(label = clean, color = color), size = size, align = TRUE,
+                offset = 0.05, fontface = "bold") +
+    geom_nodepoint(color = "#007bff", size = 3) +
+    scale_color_identity() +
+    theme_tree2() +
+    theme(axis.text.x = element_text(size = 12, face = "bold"))
+  
+  xmax <- max(grafico$data$x, na.rm = TRUE)
+  grafico + xlim(0, xmax * 1.45)
+}
+
+# --- 6. MODELLO RANDOM FOREST -----------------------------------------------
+# Restituisce sempre una lista: ok = TRUE/FALSE, e un messaggio se non può girare
+calcola_modello <- function(dati) {
+  d <- dati[!is.na(dati$eta) & !is.na(dati$freq) & !is.na(dati$corretto), , drop = FALSE]
+  if (nrow(d) < 5) {
+    return(list(ok = FALSE, msg = paste0("Il modello serve almeno 5 risposte (per ora ce ne sono ", nrow(d), ").")))
+  }
+  if (length(unique(d$corretto)) < 2) {
+    return(list(ok = FALSE, msg = "Il modello ha bisogno sia di risposte corrette sia di risposte sbagliate."))
+  }
+  if (length(unique(d$eta)) < 2 && length(unique(d$freq)) < 2) {
+    return(list(ok = FALSE, msg = "Finora tutti hanno la stessa età e lo stesso consumo: il modello non può distinguere nessuno."))
+  }
+  d$y <- factor(ifelse(d$corretto, "Si", "No"), levels = c("No", "Si"))
+  fit <- tryCatch(randomForest(y ~ eta + freq, data = d, ntree = 200), error = function(e) e)
+  if (inherits(fit, "error")) {
+    return(list(ok = FALSE, msg = paste("Errore nel modello:", fit$message)))
+  }
+  list(ok = TRUE, fit = fit, data = d, n = nrow(d))
+}
+
+# Probabilità stimata che il giocatore indovini, in base a età e consumo
+probabilita_utente <- function(mod, eta, freq) {
+  nd <- data.frame(eta = as.numeric(eta), freq = as.numeric(freq))
+  as.numeric(predict(mod$fit, newdata = nd, type = "prob")[1, "Si"])
+}
+
+# Curva ROC sulle probabilità out-of-bag (ogni risposta valutata senza usarla per addestrare)
+curva_roc <- function(mod) {
+  prob <- mod$fit$votes[, "Si"]
+  pROC::roc(mod$data$y, prob, levels = c("No", "Si"), direction = "<", quiet = TRUE)
+}
+
+# --- 7. CLASSIFICA -----------------------------------------------------------
+# Per ogni partecipante: miglior punteggio tra le partite complete (10 risposte)
+classifica_df <- function(dati) {
+  d <- dati[!is.na(dati$id_partita) & nzchar(dati$id_partita) &
+              !is.na(dati$nickname) & nzchar(dati$nickname), , drop = FALSE]
+  if (nrow(d) == 0) return(NULL)
+  
+  # una riga per partita: nickname, risposte date, risposte corrette
+  partite <- do.call(rbind, lapply(split(d, d$id_partita), function(p) {
+    data.frame(nickname = p$nickname[1], risposte = nrow(p),
+               corrette = sum(p$corretto), stringsAsFactors = FALSE)
+  }))
+  partite <- partite[partite$risposte == 10, , drop = FALSE]   # solo partite complete
+  if (nrow(partite) == 0) return(NULL)
+  
+  # una riga per partecipante: miglior punteggio e numero di partite complete
+  utenti <- do.call(rbind, lapply(split(partite, partite$nickname), function(u) {
+    data.frame(nickname = u$nickname[1], punteggio = max(u$corrette),
+               partite = nrow(u), stringsAsFactors = FALSE)
+  }))
+  utenti <- utenti[order(-utenti$punteggio, utenti$nickname), , drop = FALSE]
+  
+  cl <- data.frame(
+    Posto = rank(-utenti$punteggio, ties.method = "min"),
+    Nickname = utenti$nickname,
+    "Miglior punteggio (su 10)" = utenti$punteggio,
+    "Partite complete" = utenti$partite,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+  rownames(cl) <- NULL
+  cl
+}
+
+# --- 8. INTERFACCIA UTENTE ---------------------------------------------------
 ui <- fluidPage(
   useShinyjs(),
   
@@ -195,7 +404,7 @@ ui <- fluidPage(
     ")),
     tags$style(HTML("
       body {
-        background-image: url('wallpaper.jpg');
+        background-image: url('Wallpaper.jpg');
         background-size: cover;
         background-repeat: no-repeat;
         background-attachment: fixed;
@@ -234,11 +443,14 @@ ui <- fluidPage(
         transition: transform 0.2s ease;
       }
       .drink-card-img:hover { transform: scale(1.03); }
-      .optional-label { font-size: 0.9em; color: #555; font-style: italic; }
+      @media print {
+        body { background: white !important; }
+        #menu_button, #menu_dropdown, .no-print, .shiny-notification { display: none !important; }
+        .well { box-shadow: none !important; }
+      }
     "))
   ),
   
-  # Menù Navigazione Rapida
   tags$div(
     style = "position: fixed; top: 10px; right: 10px; z-index: 2000;",
     tags$button(
@@ -250,7 +462,8 @@ ui <- fluidPage(
       id = "menu_dropdown",
       style = "display:none; position:absolute; right:0; background-color: rgba(255,255,255,0.95); border-radius: 8px; margin-top:5px; padding:5px; min-width:180px; box-shadow: 0px 4px 8px rgba(0,0,0,0.2);",
       actionButton("go_dashboard_menu", "📊 Classifica & IA", style = "width:100%; border:none; background:none; text-align:left; padding:8px;"),
-      actionButton("go_tree_menu", "🌳 Albero Tassonomico", style = "width:100%; border:none; background:none; text-align:left; padding:8px;")
+      actionButton("go_tree_menu", "🌳 Albero Tassonomico", style = "width:100%; border:none; background:none; text-align:left; padding:8px;"),
+      actionButton("go_operatore", "🔒 Scheda operatore", style = "width:100%; border:none; background:none; text-align:left; padding:8px;")
     )
   ),
   
@@ -264,7 +477,7 @@ ui <- fluidPage(
   ")),
   
   tags$img(
-    src = "logo Sapienza (rgb).png", 
+    src = "logo Sapienza (rgb).png",
     style = "position: fixed; bottom: 10px; left: 10px; width: 220px; height: auto; z-index: 1500;",
     onerror = "this.style.display='none'"
   ),
@@ -272,17 +485,19 @@ ui <- fluidPage(
   uiOutput("main_ui")
 )
 
-# --- 5. LOGICA SERVER ---
+# --- 9. LOGICA SERVER --------------------------------------------------------
 server <- function(input, output, session) {
   
   rv <- reactiveValues(
-    seen_species = character(0),
-    correct_species = character(0),
-    wrong_species = character(0)
+    visti = character(0),    # bevande mostrate nella partita (per l'albero)
+    esito = character(0),    # "verde" o "rosso" per ogni bevanda
+    aggiornamento = 0,       # aumenta quando bisogna rileggere le risposte
+    operatore_ok = FALSE     # TRUE solo dopo il PIN corretto
   )
   
   game <- reactiveValues(
     stage = "start",
+    id = NULL,
     nickname = NULL,
     eta = 20,
     genere = "Maschio",
@@ -290,42 +505,33 @@ server <- function(input, output, session) {
     fortuna = "Molto",
     maratona_ny = "",
     sabato_sera = "",
+    mode = "3",
+    lista = NULL,
     turn = 1,
     correct = 0,
     current = NULL,
     choice_made = FALSE,
-    selected = NULL,
-    mode_selection = "3"
+    selected = NULL
   )
   
-  dati_iniziali <- data.frame(
-    timestamp = rep(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), 5),
-    nickname = c("Alice", "Marco", "Giulia", "Luca", "Sofia"),
-    eta = c(22, 28, 19, 35, 24),
-    genere = c("Femmina", "Maschio", "Non-binario", "Preferisco non dirlo", "Femmina"),
-    freq = c(3, 5, 2, 7, 4),
-    fortuna = c("Molto", "Poco", "Molto", "Poco", "Molto"),
-    maratona_ny = c("Sì, subito!", "No, resto in hotel", "Solo per far foto", "Preferisco una pizza", "Forse"),
-    sabato_sera = c("Uscita con amici", "Serie TV e divano", "Discoteca", "Cena tranquilla", "Gaming"),
-    scelta = c("Opzione_1", "Opzione_2", "Opzione_1", "Opzione_1", "Opzione_2"),
-    corretto = c(TRUE, FALSE, TRUE, TRUE, FALSE),
-    stringsAsFactors = FALSE
-  )
-  risposte <- reactiveVal(dati_iniziali)
+  # Tutte le risposte, rilette dal foglio solo quando servono
+  dati_globali <- reactive({
+    rv$aggiornamento
+    leggi_risposte()
+  })
   
-  models_data <- reactive({
-    df <- risposte()
-    req(nrow(df) >= 3)
-    df$corretto_f <- factor(ifelse(df$corretto, "Si", "No"), levels = c("No", "Si"))
-    if (length(unique(df$corretto_f)) < 2) return(NULL)
-    
-    fit_rf <- tryCatch(randomForest(corretto_f ~ eta + freq, data = df, ntree = 50), error = function(e) NULL)
-    list(fit_rf = fit_rf, df = df)
+  # Modello random forest calcolato su tutti i partecipanti
+  modello <- reactive({
+    dg <- dati_globali()
+    if (!is.null(dg$errore)) {
+      return(list(ok = FALSE, msg = paste("Dati non disponibili:", dg$errore)))
+    }
+    calcola_modello(dg$dati)
   })
   
   output$main_ui <- renderUI({
     
-    # --- 1. START SCREEN ---
+    # --- 1. START ---
     if (game$stage == "start") {
       tagList(
         div(class = "game-title", "Disseta la tua sete di dati 🥤"),
@@ -335,8 +541,8 @@ server <- function(input, output, session) {
           textInput("nickname", "🌟 Inserisci un nickname:"),
           numericInput("eta", "🎂 Quanti anni hai?", value = 20, min = 2, max = 100),
           
-          radioButtons("genere", "👦👧🌈 Genere:", 
-                       choices = c("Maschio", "Femmina", "Non-binario", "Preferisco non dirlo"), 
+          radioButtons("genere", "👦👧🌈 Genere:",
+                       choices = c("Maschio", "Femmina", "Non-binario", "Preferisco non dirlo"),
                        selected = "Maschio", inline = FALSE),
           
           sliderInput("freq", "🥤 Quante bibite gassate bevi a settimana?", min = 0, max = 14, value = 3),
@@ -344,8 +550,10 @@ server <- function(input, output, session) {
           
           hr(),
           h4("📝 Domande sullo stile di vita (Opzionali)"),
-          textInput("maratona_ny", "🏃 Se ti invitassero a New York, faresti la maratona?", placeholder = "es. Sì subito / Solo se posso fare foto / No..."),
-          textInput("sabato_sera", "🍕 Descrivi il tuo sabato sera ideale:", placeholder = "es. Divano e serie TV / Discoteca con amici / Cena fuori..."),
+          textInput("maratona_ny", "🏃 Se ti invitassero a New York, faresti la maratona?",
+                    placeholder = "es. Sì subito / Solo se posso fare foto / No..."),
+          textInput("sabato_sera", "🍕 Descrivi il tuo sabato sera ideale:",
+                    placeholder = "es. Divano e serie TV / Discoteca con amici / Cena fuori..."),
           
           hr(),
           radioButtons("mode_select", "🎯 Scegli la modalità del gioco:",
@@ -354,67 +562,91 @@ server <- function(input, output, session) {
                                    "Mista / Alternata (Casuale)" = "mix"),
                        selected = "3"),
           
-          actionButton("start_game", "🚀 Inizia il gioco", class = "btn-primary btn-lg", style = "width:100%; font-size:18px; padding:10px 30px;")
+          actionButton("start_game", "🚀 Inizia il gioco", class = "btn-primary btn-lg",
+                       style = "width:100%; font-size:18px; padding:10px 30px;")
         )
       )
       
-      # --- 2. SCHERMATA DI GIOCO ---
+      # --- 2. GIOCO ---
     } else if (game$stage == "play") {
       curr <- game$current
-      num_c <- curr$num_choices
-      col_w <- if(num_c == 3) 4 else 6
+      n <- length(curr$ids)
+      col_w <- if (n == 3) 4 else 6
       
       wellPanel(
         class = "panel-large",
-        div(style="text-align:center;",
-            h3(paste0("Turno ", game$turn, " di 10 — ", if(num_c == 3) "Trova l'Intruso (3 Bicchieri)" else "Assaggio alla Cieca (2 Bicchieri)"))
-        ),
+        div(style = "text-align:center;",
+            h3(paste0("Lista ", curr$lista, " · Domanda #", game$turn, " di 10")),
+            h4(if (n == 3) "Trova l'Intruso (3 Bicchieri): quale bevanda è l'intruso?"
+               else paste0("Assaggio alla Cieca (2 Bicchieri): quale dei due bicchieri è ", curr$target, "?"))),
         br(),
         
-        if(game$choice_made) {
-          corretto <- if(num_c == 3) (game$selected == curr$intruder) else (game$selected == curr$target_idx)
+        if (game$choice_made) {
+          corretto <- game$selected == curr$correct_idx
           div(style = "text-align:center; padding:10px; margin-bottom:15px;",
-              if(corretto) {
-                tags$h3(paste0("✅ Complimenti, ", game$nickname, "! Hai indovinato!"), style = "color:#155724; background:#d4edda; padding:12px; border-radius:10px;")
+              if (corretto) {
+                tags$h3(paste0("✅ Complimenti, ", game$nickname, "! Hai indovinato!"),
+                        style = "color:#155724; background:#d4edda; padding:12px; border-radius:10px;")
               } else {
-                tags$h3(paste0("❌ Oh no ", game$nickname, ", non era la risposta corretta..."), style = "color:#721c24; background:#f8d7da; padding:12px; border-radius:10px;")
-              }
-          )
+                tags$h3(paste0("❌ Oh no ", game$nickname, ", non era la risposta corretta..."),
+                        style = "color:#721c24; background:#f8d7da; padding:12px; border-radius:10px;")
+              })
         },
         
         fluidRow(
-          lapply(1:num_c, function(i) {
+          lapply(seq_len(n), function(i) {
+            id <- curr$ids[i]
+            # Blind test: prima della risposta il bicchiere è neutro, senza la foto della bevanda
+            nascosto <- n == 2 && !game$choice_made
+            etichetta <- if (nascosto) {
+              paste("Bicchiere", LETTERS[i])
+            } else {
+              paste0("Bicchiere ", LETTERS[i], ": ", nome_bev(id))
+            }
+            
+            bordo <- "#495057"
+            if (game$choice_made) {
+              if (i == game$selected) {
+                bordo <- if (i == curr$correct_idx) "#28a745" else "#dc3545"
+              } else if (i == curr$correct_idx) {
+                bordo <- "#28a745"
+              }
+            }
+            
+            click <- if (!game$choice_made) sprintf("Shiny.setInputValue('choice_%d', Math.random());", i)
+            
+            immagine <- if (nascosto) {
+              tags$img(
+                class = "drink-card-img",
+                src = BICCHIERE_NEUTRO,
+                style = paste0("border: 4px solid ", bordo),
+                onclick = click
+              )
+            } else {
+              tags$img(
+                class = "drink-card-img",
+                src = immagine_bev(id),
+                style = paste0("border: 4px solid ", bordo),
+                onclick = click,
+                onerror = "this.style.display='none'"
+              )
+            }
+            
             column(
               col_w,
               div(
                 style = "text-align:center; padding:10px; background:white; border-radius:15px; box-shadow:0 4px 10px rgba(0,0,0,0.08); margin-bottom:15px;",
-                tags$img(
-                  class = "drink-card-img",
-                  src = curr$urls[i],
-                  style = paste0(
-                    "border: 4px solid ",
-                    if(game$choice_made && i == game$selected) {
-                      is_win <- if(num_c == 3) (i == curr$intruder) else (i == curr$target_idx)
-                      if(is_win) "#28a745" else "#dc3545"
-                    } else if(game$choice_made && ((num_c == 3 && i == curr$intruder) || (num_c == 2 && i == curr$target_idx))) {
-                      "#28a745"
-                    } else {
-                      "#495057"
-                    }
-                  ),
-                  onclick = if(!game$choice_made) sprintf("Shiny.setInputValue('choice_%d', Math.random());", i),
-                  onerror = "this.src='https://images.unsplash.com/photo-1527960471264-932f39eb5846?w=400';"
-                ),
-                div(style = "margin-top:10px; font-weight:bold; font-size:18px;", curr$species[i])
+                immagine,
+                div(style = "margin-top:10px; font-weight:bold; font-size:18px;", etichetta)
               )
             )
           })
         ),
         
-        if(game$choice_made) {
+        if (game$choice_made) {
           div(style = "text-align:center; margin-top:20px;",
-              actionButton("view_step_tree", "Vedi albero in costruzione 🌳 ➡️", class = "btn-success btn-lg", style = "font-size:18px; padding:10px 40px;")
-          )
+              actionButton("view_step_tree", "Vedi albero in costruzione 🌳 ➡️", class = "btn-success btn-lg",
+                           style = "font-size:18px; padding:10px 40px;"))
         }
       )
       
@@ -424,24 +656,30 @@ server <- function(input, output, session) {
         class = "panel-large",
         h2("Il tuo albero finora 🌳"),
         plotOutput("turn_tree_plot", height = "480px"),
-        div(
-          style = "text-align:center; margin-top:20px;",
-          actionButton(
-            "continue_after_tree",
-            if (game$turn == 10) "Vai ai risultati finali 🎉" else "Continua ➡️",
-            class = "btn-primary btn-lg",
-            style = "font-size:18px; padding:10px 40px;"
-          )
-        )
+        div(style = "text-align:center; margin-top:20px;",
+            actionButton("continue_after_tree",
+                         if (game$turn == 10) "Vai ai risultati finali 🎉" else "Continua ➡️",
+                         class = "btn-primary btn-lg",
+                         style = "font-size:18px; padding:10px 40px;"))
       )
       
-      # --- 4. SCHERMATA FINE GAME ---
+      # --- 4. FINE PARTITA: punteggio e classifica ---
     } else if (game$stage %in% c("lose", "win")) {
       wellPanel(
         class = "panel-small",
-        h2(if(game$stage == "win") "Perfetto! 🎉" else "Partita Completata!"),
+        h2(if (game$stage == "win") "Perfetto! 🎉" else "Partita Completata!"),
         h3(paste("Punteggio:", game$correct, "/ 10")),
-        actionButton("go_tree_dashboard", "Scopri la Tassonomia Finale e la Classifica", class = "btn-info btn-lg", style = "width:100%; font-size:16px; padding:10px 25px;")
+        uiOutput("posto_utente"),
+        h4("🏆 Classifica di tutti i partecipanti"),
+        tableOutput("tabella_classifica"),
+        br(),
+        div(style = "text-align:center;",
+            actionButton("go_tree_dashboard", "🌳 Albero finale", class = "btn-info btn-lg",
+                         style = "font-size:16px; padding:10px 25px; margin:5px;"),
+            actionButton("go_leaderboard", "📊 Dashboard & IA", class = "btn-primary btn-lg",
+                         style = "font-size:16px; padding:10px 25px; margin:5px;"),
+            actionButton("restart", "🔄 Nuova partita", class = "btn-warning btn-lg",
+                         style = "font-size:16px; padding:10px 25px; margin:5px;"))
       )
       
       # --- 5. ALBERO FINALE ---
@@ -451,103 +689,139 @@ server <- function(input, output, session) {
         h2("Il tuo percorso nella Tassonomia delle Bibite 🌳"),
         plotOutput("final_tree", height = "480px"),
         div(style = "text-align:center; margin-top:20px;",
-            actionButton("go_leaderboard", "Vai alla Dashboard & IA", class = "btn-primary btn-lg", style = "font-size:16px; padding:10px 25px;")
-        )
+            actionButton("go_leaderboard", "📊 Classifica & Dashboard IA", class = "btn-primary btn-lg",
+                         style = "font-size:16px; padding:10px 25px;"))
       )
       
-      # --- 6. DASHBOARD & IA ---
+      # --- 6. CLASSIFICA & DASHBOARD IA ---
     } else if (game$stage == "dashboard") {
       wellPanel(
         class = "panel-dashboard",
-        h2("📊 Dashboard & Predizioni IA in Tempo Reale"),
+        h2("📊 Classifica & Dashboard IA"),
+        p(style = "font-size:0.9em; color:#555;", paste("Salvataggio risposte:", STATO_SALVATAGGIO)),
         fluidRow(
           column(6,
-                 h4("🤖 Modelli IA (Random Forest)"),
+                 h4("🏆 Classifica"),
+                 tableOutput("tabella_classifica"),
+                 br(),
+                 actionButton("aggiorna", "🔄 Aggiorna dati", class = "btn-secondary")),
+          column(6,
+                 h4("🤖 Modello IA (Random Forest)"),
                  uiOutput("predizione_realtime_ui"),
                  br(),
-                 h4("📋 Ultime Risposte Registrate"),
-                 tableOutput("tabella_risposte")
-          ),
-          column(6,
-                 h4("📈 Curva ROC del Modello"),
-                 plotOutput("roc_combined", height = "300px")
-          )
+                 h4("📈 Curva ROC"),
+                 plotOutput("roc_combined", height = "300px"))
         ),
         hr(),
-        actionButton("restart", "Nuova Partita 🔄", class = "btn-warning btn-lg", style = "font-size:16px; padding:10px 30px;")
+        h4("📋 Ultime risposte registrate"),
+        tableOutput("tabella_risposte"),
+        hr(),
+        actionButton("restart", "🔄 Nuova partita", class = "btn-warning btn-lg",
+                     style = "font-size:16px; padding:10px 30px;")
       )
+      
+      # --- 7. SCHEDA OPERATORE (riservata, con PIN) ---
+    } else if (game$stage == "operatore") {
+      if (!isTRUE(rv$operatore_ok)) {
+        wellPanel(
+          class = "panel-small",
+          h2("🔒 Scheda operatore"),
+          p("Pagina riservata: serve il PIN."),
+          passwordInput("pin_operatore", "PIN:"),
+          actionButton("entra_operatore", "Entra", class = "btn-primary"),
+          actionButton("esci_operatore", "⬅ Indietro", class = "btn-default")
+        )
+      } else {
+        wellPanel(
+          class = "panel-large",
+          div(class = "no-print", style = "text-align:right;",
+              tags$button("🖨️ Stampa", onclick = "window.print()", class = "btn btn-default"),
+              actionButton("esci_operatore", "⬅ Chiudi", class = "btn-default")),
+          h2("Scheda operatore (riservata)"),
+          uiOutput("in_corso"),
+          p("Prepara i bicchieri come indicato. Non mostrare questa pagina ai partecipanti."),
+          tableOutput("tabella_operatore")
+        )
+      }
     }
   })
   
-  # Avvio Gioco
+  # Avvio gioco
   observeEvent(input$start_game, {
-    req(input$nickname)
-    game$nickname <- input$nickname
+    nick <- trimws(input$nickname)
+    req(nzchar(nick), !is.na(input$eta))
+    
+    game$id <- sprintf("%s_%06d", format(Sys.time(), "%Y%m%d%H%M%S"), sample.int(999999, 1))
+    game$nickname <- nick
     game$eta <- input$eta
     game$genere <- input$genere
     game$freq <- input$freq
     game$fortuna <- input$fortuna
-    game$maratona_ny <- if(!is.null(input$maratona_ny) && input$maratona_ny != "") input$maratona_ny else "Non specificato"
-    game$sabato_sera <- if(!is.null(input$sabato_sera) && input$sabato_sera != "") input$sabato_sera else "Non specificato"
-    game$mode_selection <- input$mode_select
+    game$maratona_ny <- if (!is.null(input$maratona_ny) && input$maratona_ny != "") input$maratona_ny else "Non specificato"
+    game$sabato_sera <- if (!is.null(input$sabato_sera) && input$sabato_sera != "") input$sabato_sera else "Non specificato"
+    game$mode <- input$mode_select
+    game$lista <- sample(1:3, 1)
     game$turn <- 1
     game$correct <- 0
     
-    rv$seen_species <- character(0)
-    rv$correct_species <- character(0)
-    rv$wrong_species <- character(0)
+    rv$visti <- character(0)
+    rv$esito <- character(0)
     
-    next_mode <- if(game$mode_selection == "mix") safe_sample(c(2, 3), 1) else as.numeric(game$mode_selection)
-    game$current <- if(next_mode == 3) {
-      generate_turn_3(1, tree, beverages_df)
-    } else {
-      generate_turn_2(1, beverages_df)
-    }
-    
+    game$current <- genera_turno(1, scegli_modalita(game$mode), game$lista)
+    rv$visti <- unique(c(rv$visti, game$current$ids))
     game$choice_made <- FALSE
+    game$selected <- NULL
     game$stage <- "play"
-    rv$seen_species <- unique(c(rv$seen_species, game$current$species_raw))
   })
   
-  # Gestione Selezione
+  # Gestione selezione (fino a 3 bicchieri)
   lapply(1:3, function(i) {
     observeEvent(input[[paste0("choice_", i)]], {
       req(!game$choice_made, game$stage == "play")
-      num_c <- game$current$num_choices
-      if(i <= num_c) {
-        game$selected <- i
-        game$choice_made <- TRUE
-        
-        is_correct <- if(num_c == 3) (i == game$current$intruder) else (i == game$current$target_idx)
-        chosen_sp <- game$current$species_raw[i]
-        
-        if (is_correct) {
-          game$correct <- game$correct + 1
-          session$sendCustomMessage("triggerConfetti", list())
-          rv$correct_species <- unique(c(rv$correct_species, game$current$species_raw))
-        } else {
-          rv$wrong_species <- unique(c(rv$wrong_species, chosen_sp))
-          rv$correct_species <- unique(c(rv$correct_species, setdiff(game$current$species_raw, chosen_sp)))
-        }
-        
-        nuovo <- data.frame(
-          timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-          nickname = game$nickname,
-          eta = game$eta,
-          genere = game$genere,
-          freq = game$freq,
-          fortuna = game$fortuna,
-          maratona_ny = game$maratona_ny,
-          sabato_sera = game$sabato_sera,
-          scelta = paste0("Opzione_", i),
-          corretto = is_correct,
-          stringsAsFactors = FALSE
-        )
-        
-        risposte(rbind(risposte(), nuovo))
-        
-        # Salvataggio nel file CSV locale
-        salva_risposta_csv(nuovo)
+      curr <- game$current
+      if (i > length(curr$ids)) return()
+      
+      game$selected <- i
+      game$choice_made <- TRUE
+      
+      is_correct <- i == curr$correct_idx
+      id_scelto <- curr$ids[i]
+      id_giusto <- curr$ids[curr$correct_idx]
+      
+      if (is_correct) {
+        game$correct <- game$correct + 1
+        session$sendCustomMessage("triggerConfetti", list())
+      }
+      
+      # Verde per la bevanda giusta, rosso per tutte le altre della domanda
+      for (id in curr$ids) {
+        rv$esito[id] <- if (id == id_giusto) "verde" else "rosso"
+      }
+      
+      nuovo <- data.frame(
+        timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+        nickname = game$nickname,
+        eta = as.numeric(game$eta),
+        genere = game$genere,
+        freq = as.numeric(game$freq),
+        fortuna = game$fortuna,
+        maratona_ny = game$maratona_ny,
+        sabato_sera = game$sabato_sera,
+        turno = game$turn,
+        modalita = curr$modalita,
+        bevanda_giusta = id_giusto,
+        bevanda_scelta = id_scelto,
+        scelta = paste0("Opzione_", i),
+        corretto = is_correct,
+        id_partita = game$id,
+        lista = curr$lista,
+        stringsAsFactors = FALSE
+      )
+      
+      errore <- salva_risposta(nuovo)
+      if (!is.null(errore)) {
+        showNotification(paste("ATTENZIONE: risposta NON salvata.", errore),
+                         type = "error", duration = NULL)
       }
     })
   })
@@ -556,18 +830,12 @@ server <- function(input, output, session) {
   
   observeEvent(input$continue_after_tree, {
     if (game$turn == 10) {
-      game$stage <- if(game$correct >= 6) "win" else "lose"
+      rv$aggiornamento <- rv$aggiornamento + 1   # rilegge le risposte per la classifica
+      game$stage <- if (game$correct >= 6) "win" else "lose"
     } else {
       game$turn <- game$turn + 1
-      next_mode <- if(game$mode_selection == "mix") safe_sample(c(2, 3), 1) else as.numeric(game$mode_selection)
-      
-      game$current <- if(next_mode == 3) {
-        generate_turn_3(game$turn, tree, beverages_df)
-      } else {
-        generate_turn_2(game$turn, beverages_df)
-      }
-      
-      rv$seen_species <- unique(c(rv$seen_species, game$current$species_raw))
+      game$current <- genera_turno(game$turn, scegli_modalita(game$mode), game$lista)
+      rv$visti <- unique(c(rv$visti, game$current$ids))
       game$choice_made <- FALSE
       game$selected <- NULL
       game$stage <- "play"
@@ -579,113 +847,130 @@ server <- function(input, output, session) {
   observeEvent(input$go_dashboard_menu, { game$stage <- "dashboard"; shinyjs::hide("menu_dropdown") })
   observeEvent(input$go_tree_menu, { game$stage <- "tree_dashboard"; shinyjs::hide("menu_dropdown") })
   observeEvent(input$restart, { game$stage <- "start" })
+  observeEvent(input$aggiorna, { rv$aggiornamento <- rv$aggiornamento + 1 })
   
-  # PLOT ALBERO PASSO-PASSO
+  # Scheda operatore: si apre solo con il PIN, e si chiude tornando alla schermata precedente
+  observeEvent(input$go_operatore, {
+    if (game$stage != "operatore") game$stage_prima <- game$stage
+    rv$operatore_ok <- FALSE
+    game$stage <- "operatore"
+    shinyjs::hide("menu_dropdown")
+  })
+  
+  observeEvent(input$entra_operatore, {
+    if (identical(trimws(input$pin_operatore), PIN_OPERATORE)) {
+      rv$operatore_ok <- TRUE
+    } else {
+      showNotification("PIN errato", type = "error")
+    }
+  })
+  
+  observeEvent(input$esci_operatore, {
+    rv$operatore_ok <- FALSE
+    game$stage <- if (is.null(game$stage_prima)) "start" else game$stage_prima
+  })
+  
+  output$in_corso <- renderUI({
+    curr <- game$current
+    prima <- game$stage_prima
+    if (!isTRUE(rv$operatore_ok) || is.null(curr) || is.null(prima) ||
+        !(prima %in% c("play", "turn_tree"))) {
+      return(NULL)
+    }
+    p(strong("In gioco adesso: "),
+      paste0("Lista ", curr$lista, ", domanda #", game$turn, " (", curr$modalita, " bicchieri)"))
+  })
+  
+  output$tabella_operatore <- renderTable({
+    if (!isTRUE(rv$operatore_ok)) return(NULL)
+    tabella_scheda_operatore()
+  }, striped = TRUE, bordered = TRUE)
+  
   output$turn_tree_plot <- renderPlot({
-    req(length(rv$seen_species) > 0)
-    valid_tips <- intersect(tree$tip.label, rv$seen_species)
-    if (length(valid_tips) < 2) valid_tips <- tree$tip.label
-    
-    subtree <- ape::keep.tip(tree, valid_tips)
-    
-    tip_colors <- sapply(subtree$tip.label, function(sp) {
-      if (sp %in% rv$wrong_species) "#dc3545"
-      else if (sp %in% rv$correct_species) "#28a745"
-      else "#6c757d"
-    })
-    
-    clean_names <- beverages_df$name[match(subtree$tip.label, beverages_df$tree_name)]
-    
-    tip_data <- data.frame(
-      label = subtree$tip.label,
-      clean_label = clean_names,
-      color = tip_colors,
-      stringsAsFactors = FALSE
-    )
-    
-    p <- ggtree(subtree, size = 1.2) %<+% tip_data +
-      geom_tiplab(aes(label = clean_label, color = color), size = 5.5, align = TRUE, offset = 0.05, fontface = "bold") +
-      geom_nodepoint(color = "#007bff", size = 3) +
-      scale_color_identity() +
-      theme_tree2() +
-      theme(axis.text.x = element_text(size = 12, face = "bold"))
-    
-    xmax <- max(p$data$x, na.rm = TRUE)
-    p + xlim(0, xmax * 1.45)
+    req(length(rv$visti) > 0)
+    plot_albero(rv$visti, rv$esito, size = 5.5)
   })
   
-  # PLOT ALBERO FINALE
   output$final_tree <- renderPlot({
-    req(length(rv$seen_species) > 0)
-    valid_tips <- intersect(tree$tip.label, rv$seen_species)
-    if(length(valid_tips) < 2) valid_tips <- tree$tip.label
-    
-    subtree <- ape::keep.tip(tree, valid_tips)
-    
-    tip_colors <- sapply(subtree$tip.label, function(sp) {
-      if (sp %in% rv$wrong_species) "#dc3545"
-      else if (sp %in% rv$correct_species) "#28a745"
-      else "#6c757d"
-    })
-    
-    clean_names <- beverages_df$name[match(subtree$tip.label, beverages_df$tree_name)]
-    
-    tip_data <- data.frame(
-      label = subtree$tip.label,
-      clean_label = clean_names,
-      color = tip_colors,
-      stringsAsFactors = FALSE
-    )
-    
-    p <- ggtree(subtree, size = 1.2) %<+% tip_data +
-      geom_tiplab(aes(label = clean_label, color = color), size = 6, align = TRUE, offset = 0.05, fontface = "bold") +
-      geom_nodepoint(color = "#007bff", size = 3) +
-      scale_color_identity() +
-      theme_tree2() +
-      theme(axis.text.x = element_text(size = 12, face = "bold"))
-    
-    xmax <- max(p$data$x, na.rm = TRUE)
-    p + xlim(0, xmax * 1.45)
+    req(length(rv$visti) > 0)
+    plot_albero(rv$visti, rv$esito, size = 6)
   })
+  
+  # Posizione del giocatore in classifica
+  output$posto_utente <- renderUI({
+    dg <- dati_globali()
+    if (!is.null(dg$errore)) {
+      return(div(style = "color:#721c24;", paste("Classifica non disponibile:", dg$errore)))
+    }
+    cl <- classifica_df(dg$dati)
+    if (is.null(cl) || is.null(game$nickname)) return(NULL)
+    pos <- cl$Posto[match(game$nickname, cl$Nickname)]
+    if (is.na(pos)) return(p("La tua partita non risulta ancora in classifica."))
+    h4(paste0("Sei al posto ", pos, " su ", nrow(cl), " partecipanti"))
+  })
+  
+  output$tabella_classifica <- renderTable({
+    dg <- dati_globali()
+    if (!is.null(dg$errore)) {
+      return(data.frame(Messaggio = paste("Dati non disponibili:", dg$errore)))
+    }
+    cl <- classifica_df(dg$dati)
+    if (is.null(cl)) {
+      d <- dg$dati
+      senza_id <- nrow(d) > 0 && all(is.na(d$id_partita))
+      msg <- if (senza_id) {
+        "Nel foglio manca la colonna id_partita: vedi le istruzioni."
+      } else {
+        "Nessuna partita completa ancora."
+      }
+      return(data.frame(Messaggio = msg))
+    }
+    cl
+  }, striped = TRUE, bordered = TRUE, hover = TRUE)
   
   output$predizione_realtime_ui <- renderUI({
-    mdl <- models_data()
-    if(is.null(mdl) || is.null(mdl$fit_rf)) return(HTML("<p>Modello IA in fase di addestramento...</p>"))
-    
-    df_pred <- data.frame(eta = game$eta, freq = game$freq)
-    prob_rf <- tryCatch(predict(mdl$fit_rf, newdata = df_pred, type = "prob")[, "Si"], error = function(e) 0.5)
-    
-    HTML(paste0(
-      "<div style='background-color:#f0f8ff; padding:15px; border-radius:10px; border-left: 5px solid #007bff;'>",
-      "<h5>🚀 Predizione Random Forest</h5>",
-      "Probabilità stimata per <b>", game$nickname, "</b> di indovinare: <b>", round(prob_rf * 100, 1), "%</b><br>",
-      "<small>Basato su età (", game$eta, ") e consumo settimanale (", game$freq, ").</small>",
-      "</div>"
-    ))
-  })
-  
-  output$tabella_risposte <- renderTable({
-    tail(risposte()[, c("timestamp", "nickname", "eta", "genere", "corretto")], 5)
+    mod <- modello()
+    if (!isTRUE(mod$ok)) {
+      return(div(style = "background:#fff3cd; padding:12px; border-radius:10px;", mod$msg))
+    }
+    p_si <- tryCatch(probabilita_utente(mod, game$eta, game$freq), error = function(e) NA_real_)
+    if (is.na(p_si)) {
+      return(div(style = "background:#fff3cd; padding:12px; border-radius:10px;",
+                 "Inserisci età e consumo di bibite per vedere la predizione."))
+    }
+    nick <- if (is.null(game$nickname)) "" else game$nickname
+    div(style = "background-color:#f0f8ff; padding:15px; border-radius:10px; border-left: 5px solid #007bff;",
+        h5("🚀 Predizione Random Forest"),
+        HTML(paste0("Probabilità stimata per <b>", htmltools::htmlEscape(nick),
+                    "</b> di indovinare: <b>", round(p_si * 100, 1), "%</b>")),
+        tags$br(),
+        tags$small(paste0("Basato su ", mod$n, " risposte. Età ", game$eta,
+                          ", bibite gassate a settimana: ", game$freq, ".")))
   })
   
   output$roc_combined <- renderPlot({
-    mdl <- models_data()
-    if (is.null(mdl) || is.null(mdl$fit_rf)) {
-      plot(c(0, 1), c(0, 1), type = "n", xlab = "1 - Specificità", ylab = "Sensitività", main = "Curva ROC IA")
-      text(0.5, 0.5, "In attesa di dati per la Curva ROC", cex = 1.1)
-      return()
+    mod <- modello()
+    tryCatch({
+      if (!isTRUE(mod$ok)) stop(mod$msg)
+      roc_obj <- curva_roc(mod)
+      plot(roc_obj, col = "#28a745", lwd = 2.5, main = "Curva ROC - Random Forest")
+      abline(0, 1, lty = 2, col = "gray")
+      legend("bottomright", legend = paste("AUC =", round(as.numeric(pROC::auc(roc_obj)), 2)),
+             col = "#28a745", lwd = 2.5, bty = "n")
+    }, error = function(e) {
+      plot.new()
+      text(0.5, 0.5, paste(strwrap(e$message, 45), collapse = "\n"), cex = 0.9, col = "#721c24")
+    })
+  })
+  
+  output$tabella_risposte <- renderTable({
+    dg <- dati_globali()
+    if (!is.null(dg$errore)) {
+      return(data.frame(Messaggio = paste("Dati non disponibili:", dg$errore)))
     }
-    
-    prob_rf <- predict(mdl$fit_rf, type = "prob")[, "Si"]
-    roc_rf <- tryCatch(pROC::roc(mdl$df$corretto_f, prob_rf, levels = c("No", "Si")), error = function(e) NULL)
-    
-    plot(c(0, 1), c(0, 1), type = "n", xlab = "1 - Specificità", ylab = "Sensitività", main = "Curva ROC - Random Forest")
-    abline(0, 1, lty = 2, col = "gray")
-    
-    if (!is.null(roc_rf)) {
-      plot(roc_rf, add = TRUE, col = "#28a745", lwd = 2.5)
-      legend("bottomright", legend = paste("AUC =", round(pROC::auc(roc_rf), 2)), col = "#28a745", lwd = 2.5, bty = "n")
-    }
+    d <- dg$dati
+    if (nrow(d) == 0) return(data.frame(Messaggio = "Nessuna risposta registrata."))
+    tail(d[, c("timestamp", "nickname", "eta", "genere", "corretto")], 5)
   })
 }
 
