@@ -132,32 +132,33 @@ leggi_risposte <- function() {
 }
 
 # --- 2. ALBERO TASSONOMICO ---------------------------------------------------
-beverage_tree_newick <- "((((coca_classic:1,coca_zero:1)Coca:1,(pepsi_classic:1,(coop_cola:1,conad_cola:1)StoreCola:1)PepsiOther:1)Cola:1,(chinotto:1,molecola:1)DarkBitter:1)DarkDrinks:1,(((fanta:1,fanta_zero:1)Fanta:1,conad_orange:1)Orange:1,(sprite:1,cedrata:1)ClearCitrus:1)Citrus:1,((estathe_limone:1,estathe_pesca:1)Estathe:1,sanbenedetto_te:1)Tea:1,(gatorade:1,powerade:1)Sports:1)Bibite;"
+# Aggiunti 7up, Pepsi Zero e Aranciata Sanpellegrino
+beverage_tree_newick <- "((((coca_classic:1,coca_zero:1)Coca:1,((pepsi_classic:1,pepsi_zero:1)Pepsi:1,(coop_cola:1,conad_cola:1)StoreCola:1)OtherCola:1)Cola:1,(chinotto:1,molecola:1)DarkBitter:1)DarkDrinks:1,(((fanta:1,fanta_zero:1)Fanta:1,(conad_orange:1,sanpellegrino_aranciata:1)OtherOrange:1)Orange:1,((sprite:1,7up:1)LemonLime:1,cedrata:1)ClearCitrus:1)Citrus:1,((estathe_limone:1,estathe_pesca:1)Estathe:1,sanbenedetto_te:1)Tea:1,(gatorade:1,powerade:1)Sports:1)Bibite;"
 
 tree <- tryCatch(ape::read.tree(text = beverage_tree_newick), error = function(e) NULL)
 
 # --- 3. BEVANDE --------------------------------------------------------------
-# image: nome del file dentro la cartella www/ (controlla maiuscole ed estensione)
+# Aggiunte le 3 nuove bevande alla fine del dataframe
 bevande <- data.frame(
   id = c("coca_classic", "coca_zero", "pepsi_classic", "coop_cola", "conad_cola",
          "chinotto", "molecola", "fanta", "fanta_zero", "conad_orange",
          "sprite", "cedrata", "estathe_limone", "estathe_pesca", "sanbenedetto_te",
-         "gatorade", "powerade"),
-  name = c("Coca-Cola Classica", "Coca-Cola Zero", "Pepsi Classica", "Coop Cola", "Conad Cola Zero",
+         "gatorade", "powerade", "pepsi_zero", "7up", "sanpellegrino_aranciata"),
+  name = c("Coca-Cola Classica", "Coca-Cola Zero", "Pepsi Classica", "Coop Cola", "Conad Cola",
            "Chinotto Sanpellegrino", "MoleCola", "Fanta Aranciata", "Fanta Zero", "Aranciata Conad",
            "Sprite", "Cedrata Tassoni", "Estathé Limone", "Estathé Pesca", "Tè San Benedetto",
-           "Gatorade", "Powerade"),
+           "Gatorade", "Powerade", "Pepsi Zero", "7Up", "Aranciata Sanpellegrino"),
   image = c("coca_classic.jpg", "coca_zero.jpg", "pepsi_classic.jpg", "coop_cola.jpg", "conad_cola.jpg",
             "chinotto.png", "molecola.jpg", "fanta.jpg", "fanta_zero.png", "conad_orange.jpeg",
             "sprite.jpg", "cedrata.jpg", "estathe_limone.jpg", "estathe_pesca.jpeg", "sanbenedetto_te.jpg",
-            "gatorade.png", "powerade.jpg"),
+            "gatorade.png", "powerade.jpg", "pepsi_zero.jpeg", "7up.jpg", "sanpellegrino_aranciata.png"),
   stringsAsFactors = FALSE
 )
 
 nome_bev     <- function(id) bevande$name[match(id, bevande$id)]
 immagine_bev <- function(id) bevande$image[match(id, bevande$id)]
 
-# Bicchiere neutro (vuoto, senza bevanda): incorporato nel codice, non serve un file in www/
+# Bicchiere neutro
 BICCHIERE_NEUTRO <- paste0(
   "data:image/svg+xml;utf8,",
   "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 300 400'>",
@@ -169,80 +170,125 @@ BICCHIERE_NEUTRO <- paste0(
 )
 
 # --- 4. LISTE DI DOMANDE -----------------------------------------------------
-# Ci sono 3 liste: a ogni partita ne viene estratta una a caso.
-# Ogni lista ha 10 livelli, dal più facile (1) al più difficile (10).
-# Ogni livello contiene:
-#   coppia  -> 2 bicchieri (blind test): A e B
-#   chiedi  -> quale dei due va riconosciuto (1 = A, 2 = B)
-#   terna   -> 3 bicchieri (trova l'intruso): A, B e C
-#   intruso -> quale dei tre è l'intruso (1 = A, 2 = B, 3 = C)
-# Le posizioni sono fisse: la scheda operatore le riporta esattamente così.
-livello <- function(coppia, chiedi, terna, intruso) {
-  list(coppia = coppia, chiedi = chiedi, terna = terna, intruso = intruso)
-}
+coppia <- function(x, y, risposta) list(ids = c(x, y), risposta = risposta)
+terna  <- function(x, y, z, risposta) list(ids = c(x, y, z), risposta = risposta)
 
-LISTE <- list(
-  
+# MODALITÀ 2 BICCHIERI (Trova la bevanda richiesta)
+LISTE_2 <- list(
   # ---- LISTA 1 ----
   list(
-    livello(c("coca_classic", "fanta"), 1, c("coca_classic", "pepsi_classic", "fanta"), 3),            # 1 facile
-    livello(c("chinotto", "sprite"), 1, c("coca_classic", "sprite", "fanta"), 1),                     # 2 facile
-    livello(c("cedrata", "gatorade"), 1, c("estathe_limone", "pepsi_classic", "sanbenedetto_te"), 2), # 3 medio-facile
-    livello(c("chinotto", "coca_classic"), 2, c("fanta", "sprite", "cedrata"), 1),                    # 4 medio
-    livello(c("fanta", "conad_orange"), 1, c("coca_zero", "coca_classic", "sprite"), 3),              # 5 medio
-    livello(c("coca_classic", "pepsi_classic"), 2, c("coop_cola", "chinotto", "coca_classic"), 2),    # 6 medio-difficile
-    livello(c("pepsi_classic", "coca_zero"), 2, c("fanta", "fanta_zero", "conad_orange"), 3),         # 7 difficile
-    livello(c("estathe_limone", "estathe_pesca"), 2, c("sanbenedetto_te", "estathe_limone", "estathe_pesca"), 1), # 8 difficile
-    livello(c("powerade", "gatorade"), 1, c("coop_cola", "chinotto", "conad_cola"), 2),               # 9 difficile: stesso colore
-    livello(c("coop_cola", "conad_cola"), 2, c("gatorade", "powerade", "cedrata"), 3)                 # 10 il più difficile
+    coppia("coca_classic", "fanta", 1),              # 1 facile
+    coppia("chinotto", "sprite", 1),                 # 2 facile
+    coppia("cedrata", "gatorade", 1),                # 3 medio-facile
+    coppia("chinotto", "coca_classic", 2),           # 4 medio: colore scuro
+    coppia("fanta", "conad_orange", 1),              # 5 medio
+    coppia("coca_classic", "pepsi_classic", 2),      # 6 medio-difficile
+    coppia("fanta", "fanta_zero", 2),                # 7 Difficile: Zuccheri vs Edulcoranti
+    coppia("coca_zero", "pepsi_zero", 1),            # 8 Molto Difficile: Sfida tra le Zero
+    coppia("coop_cola", "conad_cola", 2),            # 9 Estremo: Sottomarca vs Sottomarca
+    coppia("sprite", "7up", 2)                       # 10 Il Boss: Quasi identiche
   ),
   
   # ---- LISTA 2 ----
   list(
-    livello(c("fanta", "chinotto"), 1, c("coca_classic", "pepsi_classic", "estathe_limone"), 3),      # 1 facile
-    livello(c("coca_zero", "sprite"), 1, c("fanta", "conad_orange", "chinotto"), 3),                  # 2 facile
-    livello(c("sanbenedetto_te", "pepsi_classic"), 1, c("coca_classic", "estathe_pesca", "sanbenedetto_te"), 1), # 3 medio-facile
-    livello(c("fanta_zero", "cedrata"), 2, c("sprite", "cedrata", "fanta_zero"), 3),                  # 4 medio
-    livello(c("coop_cola", "pepsi_classic"), 1, c("coop_cola", "fanta", "conad_cola"), 2),            # 5 medio
-    livello(c("coca_zero", "chinotto"), 2, c("chinotto", "coca_zero", "coca_classic"), 1),            # 6 medio-difficile
-    livello(c("cedrata", "sprite"), 2, c("conad_orange", "fanta", "fanta_zero"), 2),                  # 7 difficile
-    livello(c("conad_orange", "fanta_zero"), 1, c("estathe_limone", "sanbenedetto_te", "estathe_pesca"), 3), # 8 difficile
-    livello(c("sanbenedetto_te", "estathe_limone"), 2, c("conad_cola", "coca_zero", "coca_classic"), 1),    # 9 difficile
-    livello(c("coca_classic", "conad_cola"), 2, c("coop_cola", "pepsi_classic", "conad_cola"), 2)     # 10 il più difficile
+    coppia("fanta", "chinotto", 1),                  # 1 facile
+    coppia("coca_zero", "sprite", 1),                # 2 facile
+    coppia("sanbenedetto_te", "pepsi_classic", 1),   # 3 medio-facile
+    coppia("fanta_zero", "cedrata", 2),              # 4 medio
+    coppia("coop_cola", "pepsi_classic", 1),         # 5 medio
+    coppia("coca_zero", "chinotto", 2),              # 6 medio-difficile
+    coppia("fanta", "sanpellegrino_aranciata", 2),   # 7 Difficile: Dolce vs Amara
+    coppia("coca_classic", "pepsi_classic", 1),      # 8 Molto Difficile: La sfida classica
+    coppia("sprite", "7up", 1),                      # 9 Estremo: Clear Citrus
+    coppia("coca_zero", "pepsi_zero", 2)             # 10 Il Boss: Sfida tra le Zero
   ),
   
   # ---- LISTA 3 ----
   list(
-    livello(c("coca_classic", "sprite"), 1, c("coca_classic", "sprite", "cedrata"), 1),               # 1 facile
-    livello(c("sanbenedetto_te", "fanta"), 1, c("conad_orange", "fanta", "sanbenedetto_te"), 3),      # 2 facile
-    livello(c("coca_zero", "estathe_pesca"), 2, c("estathe_limone", "coca_zero", "sanbenedetto_te"), 2), # 3 medio-facile
-    livello(c("fanta", "sprite"), 1, c("cedrata", "fanta", "sprite"), 1),                             # 4 medio
-    livello(c("conad_cola", "pepsi_classic"), 1, c("fanta_zero", "pepsi_classic", "conad_cola"), 1),  # 5 medio
-    livello(c("pepsi_classic", "chinotto"), 2, c("coca_zero", "coca_classic", "pepsi_classic"), 3),   # 6 medio-difficile
-    livello(c("fanta", "fanta_zero"), 2, c("conad_orange", "fanta_zero", "fanta"), 2),                # 7 difficile
-    livello(c("estathe_pesca", "sanbenedetto_te"), 2, c("estathe_limone", "estathe_pesca", "sanbenedetto_te"), 1), # 8 difficile
-    livello(c("coop_cola", "conad_cola"), 1, c("conad_cola", "coca_zero", "coop_cola"), 2),           # 9 difficile
-    livello(c("powerade", "gatorade"), 2, c("coca_zero", "pepsi_classic", "conad_cola"), 3)           # 10 il più difficile
+    coppia("coca_classic", "sprite", 1),             # 1 facile
+    coppia("sanbenedetto_te", "fanta", 1),           # 2 facile
+    coppia("coca_zero", "estathe_pesca", 2),         # 3 medio-facile
+    coppia("fanta", "sprite", 1),                    # 4 medio
+    coppia("conad_cola", "pepsi_classic", 1),        # 5 medio
+    coppia("pepsi_classic", "chinotto", 2),          # 6 medio-difficile
+    coppia("coca_zero", "pepsi_zero", 1),            # 7 Difficile
+    coppia("fanta_zero", "sanpellegrino_aranciata", 2), # 8 Molto Difficile
+    coppia("coop_cola", "conad_cola", 1),            # 9 Estremo
+    coppia("sprite", "7up", 2)                       # 10 Il Boss
   )
 )
 
-# Controllo delle liste all'avvio: segnala nel terminale eventuali errori di scrittura
+# MODALITÀ 3 BICCHIERI (Trova l'intruso)
+LISTE_3 <- list(
+  # ---- LISTA 1 ----
+  list(
+    terna("gatorade", "coca_classic", "pepsi_classic", 1),     # 1 facile
+    terna("fanta", "conad_orange", "coca_zero", 3),            # 2 facile
+    terna("coop_cola", "sanbenedetto_te", "estathe_pesca", 1), # 3 medio-facile
+    terna("sprite", "conad_orange", "cedrata", 2),             # 4 medio
+    terna("coca_zero", "pepsi_classic", "cedrata", 3),         # 5 medio
+    terna("coop_cola", "chinotto", "pepsi_classic", 2),        # 6 medio-difficile
+    terna("coca_classic", "pepsi_classic", "coca_zero", 3),    # 7 Difficile: Unica senza zucchero
+    terna("fanta", "fanta_zero", "sanpellegrino_aranciata", 3),# 8 Molto diff: Unica non Fanta
+    terna("sprite", "7up", "cedrata", 3),                      # 9 Estremo: Limone vs Cedro
+    terna("coop_cola", "conad_cola", "coca_classic", 3)        # 10 Il Boss: Marca vs Sottomarche
+  ),
+  
+  # ---- LISTA 2 ----
+  list(
+    terna("fanta", "coca_zero", "pepsi_classic", 1),           # 1 facile
+    terna("sprite", "pepsi_classic", "cedrata", 2),            # 2 facile
+    terna("estathe_limone", "sanbenedetto_te", "coop_cola", 3),# 3 medio-facile
+    terna("conad_orange", "estathe_pesca", "estathe_limone", 1), # 4 medio
+    terna("conad_cola", "sprite", "coop_cola", 2),             # 5 medio
+    terna("pepsi_classic", "coca_classic", "chinotto", 3),     # 6 medio-difficile
+    terna("fanta", "conad_orange", "fanta_zero", 3),           # 7 Difficile: Unica senza zucchero
+    terna("coca_classic", "coca_zero", "pepsi_zero", 1),       # 8 Molto Difficile: Unica con zucchero
+    terna("sprite", "7up", "fanta", 3),                        # 9 Estremo: Intruso cromatico/gusto
+    terna("coca_zero", "pepsi_zero", "coca_classic", 3)        # 10 Il Boss: Unica con zucchero
+  ),
+  
+  # ---- LISTA 3 ----
+  list(
+    terna("gatorade", "powerade", "fanta", 3),                 # 1 facile
+    terna("cedrata", "fanta", "conad_orange", 1),              # 2 facile
+    terna("estathe_pesca", "coca_zero", "sanbenedetto_te", 2), # 3 medio-facile
+    terna("sprite", "cedrata", "chinotto", 3),                 # 4 medio
+    terna("conad_cola", "coca_zero", "sprite", 3),             # 5 medio
+    terna("chinotto", "coca_zero", "coop_cola", 1),            # 6 medio-difficile
+    terna("sprite", "7up", "cedrata", 3),                      # 7 Difficile: Unica non Lemon-Lime
+    terna("coop_cola", "conad_cola", "pepsi_classic", 3),      # 8 Molto diff: Unica di Marca
+    terna("coca_classic", "coca_zero", "pepsi_classic", 3),    # 9 Estremo: L'unica Pepsi
+    terna("pepsi_classic", "pepsi_zero", "coca_zero", 1)       # 10 Il Boss: Unica con zucchero
+  )
+)
+
+# Controllo delle liste all'avvio
 valida_liste <- function() {
   problemi <- character(0)
-  for (l in seq_along(LISTE)) {
-    if (length(LISTE[[l]]) != 10) {
-      problemi <- c(problemi, paste("Lista", l, "non ha 10 domande"))
+  controlla <- function(nome, liste, n_bicchieri) {
+    if (length(liste) != 3) {
+      problemi <<- c(problemi, paste(nome, "- servono 3 liste"))
     }
-    for (k in seq_along(LISTE[[l]])) {
-      lv <- LISTE[[l]][[k]]
-      if (!all(c(lv$coppia, lv$terna) %in% bevande$id)) {
-        problemi <- c(problemi, paste("Lista", l, "domanda", k, ": nome bevanda sbagliato"))
+    for (l in seq_along(liste)) {
+      if (length(liste[[l]]) != 10) {
+        problemi <<- c(problemi, paste(nome, "- lista", l, ": servono 10 domande"))
       }
-      if (length(unique(lv$coppia)) != 2 || length(unique(lv$terna)) != 3) {
-        problemi <- c(problemi, paste("Lista", l, "domanda", k, ": bevande ripetute"))
+      for (k in seq_along(liste[[l]])) {
+        d <- liste[[l]][[k]]
+        ok_ids <- length(d$ids) == n_bicchieri && length(unique(d$ids)) == n_bicchieri &&
+          all(d$ids %in% bevande$id)
+        if (!ok_ids) {
+          problemi <<- c(problemi, paste(nome, "- lista", l, "domanda", k, ": bevande sbagliate o ripetute"))
+        }
+        if (!(d$risposta %in% seq_len(n_bicchieri))) {
+          problemi <<- c(problemi, paste(nome, "- lista", l, "domanda", k, ": risposta fuori range"))
+        }
       }
     }
   }
+  controlla("Assaggio a 2 bicchieri", LISTE_2, 2)
+  controlla("Assaggio a 3 bicchieri", LISTE_3, 3)
   if (length(problemi) > 0) message("ATTENZIONE liste domande:\n", paste(problemi, collapse = "\n"))
   invisible(problemi)
 }
@@ -254,36 +300,38 @@ scegli_modalita <- function(mode) {
 
 # Restituisce le bevande del turno nell'ordine fisso dei bicchieri A, B, C
 genera_turno <- function(turno, modalita, lista) {
-  lv <- LISTE[[lista]][[turno]]
   if (modalita == 3) {
-    list(modalita = 3, lista = lista, turno = turno, ids = lv$terna,
-         correct_idx = lv$intruso, target = NULL)
+    d <- LISTE_3[[lista]][[turno]]
+    list(modalita = 3, lista = lista, turno = turno, ids = d$ids,
+         correct_idx = d$risposta, target = NULL)
   } else {
-    list(modalita = 2, lista = lista, turno = turno, ids = lv$coppia,
-         correct_idx = lv$chiedi, target = nome_bev(lv$coppia[lv$chiedi]))
+    d <- LISTE_2[[lista]][[turno]]
+    list(modalita = 2, lista = lista, turno = turno, ids = d$ids,
+         correct_idx = d$risposta, target = nome_bev(d$ids[d$risposta]))
   }
 }
 
-# Scheda operatore: per ogni lista e domanda, i bicchieri da preparare
+# Scheda operatore
 tabella_scheda_operatore <- function() {
   righe <- list()
-  for (l in seq_along(LISTE)) {
-    for (k in seq_along(LISTE[[l]])) {
-      lv <- LISTE[[l]][[k]]
+  for (l in seq_along(LISTE_2)) {
+    for (k in seq_along(LISTE_2[[l]])) {
+      d2 <- LISTE_2[[l]][[k]]
+      d3 <- LISTE_3[[l]][[k]]
       righe[[length(righe) + 1]] <- data.frame(
         Lista = l, Domanda = k, Bicchieri = 2,
-        "Bicchiere A" = nome_bev(lv$coppia[1]),
-        "Bicchiere B" = nome_bev(lv$coppia[2]),
+        "Bicchiere A" = nome_bev(d2$ids[1]),
+        "Bicchiere B" = nome_bev(d2$ids[2]),
         "Bicchiere C" = "-",
-        "Risposta corretta" = paste0(LETTERS[lv$chiedi], ": ", nome_bev(lv$coppia[lv$chiedi])),
+        "Risposta corretta" = paste0(LETTERS[d2$risposta], ": ", nome_bev(d2$ids[d2$risposta])),
         check.names = FALSE, stringsAsFactors = FALSE
       )
       righe[[length(righe) + 1]] <- data.frame(
         Lista = l, Domanda = k, Bicchieri = 3,
-        "Bicchiere A" = nome_bev(lv$terna[1]),
-        "Bicchiere B" = nome_bev(lv$terna[2]),
-        "Bicchiere C" = nome_bev(lv$terna[3]),
-        "Risposta corretta" = paste0("intruso ", LETTERS[lv$intruso], ": ", nome_bev(lv$terna[lv$intruso])),
+        "Bicchiere A" = nome_bev(d3$ids[1]),
+        "Bicchiere B" = nome_bev(d3$ids[2]),
+        "Bicchiere C" = nome_bev(d3$ids[3]),
+        "Risposta corretta" = paste0("intruso ", LETTERS[d3$risposta], ": ", nome_bev(d3$ids[d3$risposta])),
         check.names = FALSE, stringsAsFactors = FALSE
       )
     }
@@ -577,7 +625,7 @@ server <- function(input, output, session) {
         class = "panel-large",
         div(style = "text-align:center;",
             h3(paste0("Lista ", curr$lista, " · Domanda #", game$turn, " di 10")),
-            h4(if (n == 3) "Trova l'Intruso (3 Bicchieri): quale bevanda è l'intruso?"
+            h4(if (n == 3) "Trova l'Intruso (3 Bicchieri): quale bicchiere è l'intruso?"
                else paste0("Assaggio alla Cieca (2 Bicchieri): quale dei due bicchieri è ", curr$target, "?"))),
         br(),
         
@@ -596,8 +644,8 @@ server <- function(input, output, session) {
         fluidRow(
           lapply(seq_len(n), function(i) {
             id <- curr$ids[i]
-            # Blind test: prima della risposta il bicchiere è neutro, senza la foto della bevanda
-            nascosto <- n == 2 && !game$choice_made
+            # Assaggio alla cieca in tutte le modalità: prima della risposta il bicchiere è neutro
+            nascosto <- !game$choice_made
             etichetta <- if (nascosto) {
               paste("Bicchiere", LETTERS[i])
             } else {
@@ -877,7 +925,7 @@ server <- function(input, output, session) {
         !(prima %in% c("play", "turn_tree"))) {
       return(NULL)
     }
-    p(strong("In gioco adesso: "),
+    p(tags$strong("In gioco adesso: "),
       paste0("Lista ", curr$lista, ", domanda #", game$turn, " (", curr$modalita, " bicchieri)"))
   })
   
