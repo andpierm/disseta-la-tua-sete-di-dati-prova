@@ -8,7 +8,6 @@ library(shinyjs)
 library(ape)
 library(ggtree)
 library(ggplot2)
-library(pROC)
 library(randomForest)
 library(googlesheets4)
 
@@ -19,6 +18,9 @@ GS_SHEET_ID   <- "1HeKjUeP7e5qMwePfYOc9K3XOZqaW7lKCg1mUJMl7xR0"
 GS_TAB        <- "risposte"               # nome della scheda nel foglio
 CSV_FILE      <- "risposte_bevande.csv"   # usato solo se Google Sheets non è disponibile
 PIN_OPERATORE <- "2026"                   # PIN della scheda operatore: cambialo prima dell'evento
+
+N_DOMANDE       <- 3   # domande per partita
+SOGLIA_VITTORIA <- 2   # risposte corrette minime per la schermata "win"
 
 # Ordine colonne: deve coincidere con la prima riga (intestazioni) del foglio
 COLONNE <- c("timestamp", "nickname", "eta", "genere", "freq", "fortuna",
@@ -132,25 +134,23 @@ leggi_risposte <- function() {
 }
 
 # --- 2. ALBERO TASSONOMICO ---------------------------------------------------
-# Aggiunti 7up, Pepsi Zero e Aranciata Sanpellegrino
-beverage_tree_newick <- "((((coca_classic:1,coca_zero:1)Coca:1,((pepsi_classic:1,pepsi_zero:1)Pepsi:1,(coop_cola:1,conad_cola:1)StoreCola:1)OtherCola:1)Cola:1,(chinotto:1,molecola:1)DarkBitter:1)DarkDrinks:1,(((fanta:1,fanta_zero:1)Fanta:1,(conad_orange:1,sanpellegrino_aranciata:1)OtherOrange:1)Orange:1,((sprite:1,7up:1)LemonLime:1,cedrata:1)ClearCitrus:1)Citrus:1,((estathe_limone:1,estathe_pesca:1)Estathe:1,sanbenedetto_te:1)Tea:1,(gatorade:1,powerade:1)Sports:1)Bibite;"
+beverage_tree_newick <- "((((coca_classic:1,coca_zero:1)Coca:1,((pepsi_classic:1,pepsi_zero:1)Pepsi:1,(consilia_cola:1,conad_cola:1)StoreCola:1)OtherCola:1)Cola:1,(chinotto:1,molecola:1)DarkBitter:1)DarkDrinks:1,(((fanta:1,fanta_zero:1)Fanta:1,(conad_orange:1,sanpellegrino_aranciata:1)OtherOrange:1)Orange:1,((sprite:1,7up:1)LemonLime:1,cedrata_sanbenedetto:1)ClearCitrus:1)Citrus:1,((estathe_limone:1,estathe_pesca:1)Estathe:1,sanbenedetto_te:1)Tea:1,(gatorade:1,powerade:1)Sports:1)Bibite;"
 
 tree <- tryCatch(ape::read.tree(text = beverage_tree_newick), error = function(e) NULL)
 
 # --- 3. BEVANDE --------------------------------------------------------------
-# Aggiunte le 3 nuove bevande alla fine del dataframe
 bevande <- data.frame(
-  id = c("coca_classic", "coca_zero", "pepsi_classic", "coop_cola", "conad_cola",
+  id = c("coca_classic", "coca_zero", "pepsi_classic", "consilia_cola", "conad_cola",
          "chinotto", "molecola", "fanta", "fanta_zero", "conad_orange",
-         "sprite", "cedrata", "estathe_limone", "estathe_pesca", "sanbenedetto_te",
+         "sprite", "cedrata_sanbenedetto", "estathe_limone", "estathe_pesca", "sanbenedetto_te",
          "gatorade", "powerade", "pepsi_zero", "7up", "sanpellegrino_aranciata"),
-  name = c("Coca-Cola Classica", "Coca-Cola Zero", "Pepsi Classica", "Coop Cola", "Conad Cola",
+  name = c("Coca-Cola Classica", "Coca-Cola Zero", "Pepsi Classica", "Consilia Cola", "Conad Cola",
            "Chinotto Sanpellegrino", "MoleCola", "Fanta Aranciata", "Fanta Zero", "Aranciata Conad",
-           "Sprite", "Cedrata Tassoni", "Estathé Limone", "Estathé Pesca", "Tè San Benedetto",
+           "Sprite", "Cedrata San Benedetto", "Estathé Limone", "Estathé Pesca", "Tè San Benedetto",
            "Gatorade", "Powerade", "Pepsi Zero", "7Up", "Aranciata Sanpellegrino"),
-  image = c("coca_classic.jpg", "coca_zero.jpg", "pepsi_classic.jpg", "coop_cola.jpg", "conad_cola.jpg",
+  image = c("coca_classic.jpg", "coca_zero.jpg", "pepsi_classic.jpg", "consilia_cola.jpg", "conad_cola.jpg",
             "chinotto.png", "molecola.jpg", "fanta.jpg", "fanta_zero.png", "conad_orange.jpeg",
-            "sprite.jpg", "cedrata.jpg", "estathe_limone.jpg", "estathe_pesca.jpeg", "sanbenedetto_te.jpg",
+            "sprite.jpg", "cedrata_sanbenedetto.jpg", "estathe_limone.jpg", "estathe_pesca.jpeg", "sanbenedetto_te.jpg",
             "gatorade.png", "powerade.jpg", "pepsi_zero.jpeg", "7up.jpg", "sanpellegrino_aranciata.png"),
   stringsAsFactors = FALSE
 )
@@ -170,172 +170,317 @@ BICCHIERE_NEUTRO <- paste0(
 )
 
 # --- 4. LISTE DI DOMANDE -----------------------------------------------------
+# Ogni lista ha N_DOMANDE (3) domande, in ordine: 1 facile, 2 medio, 3 difficile.
+# coppia(x, y, risposta): assaggio alla cieca, "risposta" = posizione della bevanda richiesta
+# terna(x, y, z, risposta): trova l'intruso, "risposta" = posizione dell'intruso
 coppia <- function(x, y, risposta) list(ids = c(x, y), risposta = risposta)
 terna  <- function(x, y, z, risposta) list(ids = c(x, y, z), risposta = risposta)
 
-# MODALITÀ 2 BICCHIERI (Trova la bevanda richiesta)
+# MODALITÀ 2 BICCHIERI (Trova la bevanda richiesta): 10 liste
 LISTE_2 <- list(
   # ---- LISTA 1 ----
   list(
-    coppia("coca_classic", "fanta", 1),              # 1 facile
-    coppia("chinotto", "sprite", 1),                 # 2 facile
-    coppia("cedrata", "gatorade", 1),                # 3 medio-facile
-    coppia("chinotto", "coca_classic", 2),           # 4 medio: colore scuro
-    coppia("fanta", "conad_orange", 1),              # 5 medio
-    coppia("coca_classic", "pepsi_classic", 2),      # 6 medio-difficile
-    coppia("fanta", "fanta_zero", 2),                # 7 Difficile: Zuccheri vs Edulcoranti
-    coppia("coca_zero", "pepsi_zero", 1),            # 8 Molto Difficile: Sfida tra le Zero
-    coppia("coop_cola", "conad_cola", 2),            # 9 Estremo: Sottomarca vs Sottomarca
-    coppia("sprite", "7up", 2)                       # 10 Il Boss: Quasi identiche
+    coppia("coca_classic", "fanta", 1),                                 # 1 facile
+    coppia("consilia_cola", "chinotto", 2),                             # 2 medio
+    coppia("sprite", "7up", 2)                                          # 3 difficile: quasi identiche
   ),
-  
   # ---- LISTA 2 ----
   list(
-    coppia("fanta", "chinotto", 1),                  # 1 facile
-    coppia("coca_zero", "sprite", 1),                # 2 facile
-    coppia("sanbenedetto_te", "pepsi_classic", 1),   # 3 medio-facile
-    coppia("fanta_zero", "cedrata", 2),              # 4 medio
-    coppia("coop_cola", "pepsi_classic", 1),         # 5 medio
-    coppia("coca_zero", "chinotto", 2),              # 6 medio-difficile
-    coppia("fanta", "sanpellegrino_aranciata", 2),   # 7 Difficile: Dolce vs Amara
-    coppia("coca_classic", "pepsi_classic", 1),      # 8 Molto Difficile: La sfida classica
-    coppia("sprite", "7up", 1),                      # 9 Estremo: Clear Citrus
-    coppia("coca_zero", "pepsi_zero", 2)             # 10 Il Boss: Sfida tra le Zero
+    coppia("chinotto", "sprite", 1),                                    # 1 facile
+    coppia("fanta", "conad_orange", 1),                                 # 2 medio
+    coppia("coca_classic", "pepsi_classic", 2)                          # 3 difficile: la sfida classica
   ),
-  
   # ---- LISTA 3 ----
   list(
-    coppia("coca_classic", "sprite", 1),             # 1 facile
-    coppia("sanbenedetto_te", "fanta", 1),           # 2 facile
-    coppia("coca_zero", "estathe_pesca", 2),         # 3 medio-facile
-    coppia("fanta", "sprite", 1),                    # 4 medio
-    coppia("conad_cola", "pepsi_classic", 1),        # 5 medio
-    coppia("pepsi_classic", "chinotto", 2),          # 6 medio-difficile
-    coppia("coca_zero", "pepsi_zero", 1),            # 7 Difficile
-    coppia("fanta_zero", "sanpellegrino_aranciata", 2), # 8 Molto Difficile
-    coppia("coop_cola", "conad_cola", 1),            # 9 Estremo
-    coppia("sprite", "7up", 2)                       # 10 Il Boss
+    coppia("gatorade", "cedrata_sanbenedetto", 2),                      # 1 facile
+    coppia("coca_zero", "chinotto", 2),                                 # 2 medio
+    coppia("fanta", "fanta_zero", 1)                                    # 3 difficile: zuccheri vs edulcoranti
+  ),
+  # ---- LISTA 4 ----
+  list(
+    coppia("sprite", "coca_classic", 2),                                # 1 facile
+    coppia("fanta_zero", "cedrata_sanbenedetto", 1),                    # 2 medio
+    coppia("consilia_cola", "conad_cola", 2)                            # 3 difficile: sottomarca vs sottomarca
+  ),
+  # ---- LISTA 5 ----
+  list(
+    coppia("estathe_pesca", "coca_zero", 1),                            # 1 facile
+    coppia("pepsi_classic", "chinotto", 2),                             # 2 medio
+    coppia("fanta", "sanpellegrino_aranciata", 1)                       # 3 difficile: dolce vs amara
+  ),
+  # ---- LISTA 6 ----
+  list(
+    coppia("sanbenedetto_te", "fanta", 2),                              # 1 facile
+    coppia("conad_orange", "cedrata_sanbenedetto", 1),                  # 2 medio
+    coppia("coca_zero", "pepsi_zero", 1)                                # 3 difficile: sfida tra le Zero
+  ),
+  # ---- LISTA 7 ----
+  list(
+    coppia("powerade", "pepsi_classic", 1),                             # 1 facile
+    coppia("conad_cola", "coca_zero", 2),                               # 2 medio
+    coppia("estathe_limone", "estathe_pesca", 2)                        # 3 difficile: stesso tè, due gusti
+  ),
+  # ---- LISTA 8 ----
+  list(
+    coppia("sanpellegrino_aranciata", "estathe_limone", 2),             # 1 facile
+    coppia("sprite", "cedrata_sanbenedetto", 1),                        # 2 medio
+    coppia("gatorade", "powerade", 1)                                   # 3 difficile: sfida tra sport drink
+  ),
+  # ---- LISTA 9 ----
+  list(
+    coppia("conad_cola", "sanbenedetto_te", 2),                         # 1 facile
+    coppia("7up", "fanta", 1),                                          # 2 medio
+    coppia("coca_classic", "coca_zero", 2)                              # 3 difficile: zucchero vs zero
+  ),
+  # ---- LISTA 10 ----
+  list(
+    coppia("cedrata_sanbenedetto", "pepsi_zero", 1),                    # 1 facile
+    coppia("conad_orange", "7up", 2),                                   # 2 medio
+    coppia("pepsi_classic", "pepsi_zero", 1)                            # 3 difficile: zucchero vs zero
   )
 )
 
-# MODALITÀ 3 BICCHIERI (Trova l'intruso)
+# MODALITÀ 3 BICCHIERI (Trova l'intruso): 10 liste
 LISTE_3 <- list(
   # ---- LISTA 1 ----
   list(
-    terna("gatorade", "coca_classic", "pepsi_classic", 1),     # 1 facile
-    terna("fanta", "conad_orange", "coca_zero", 3),            # 2 facile
-    terna("coop_cola", "sanbenedetto_te", "estathe_pesca", 1), # 3 medio-facile
-    terna("sprite", "conad_orange", "cedrata", 2),             # 4 medio
-    terna("coca_zero", "pepsi_classic", "cedrata", 3),         # 5 medio
-    terna("coop_cola", "chinotto", "pepsi_classic", 2),        # 6 medio-difficile
-    terna("coca_classic", "pepsi_classic", "coca_zero", 3),    # 7 Difficile: Unica senza zucchero
-    terna("fanta", "fanta_zero", "sanpellegrino_aranciata", 3),# 8 Molto diff: Unica non Fanta
-    terna("sprite", "7up", "cedrata", 3),                      # 9 Estremo: Limone vs Cedro
-    terna("coop_cola", "conad_cola", "coca_classic", 3)        # 10 Il Boss: Marca vs Sottomarche
+    terna("gatorade", "coca_classic", "pepsi_classic", 1),              # 1 facile
+    terna("sprite", "conad_orange", "cedrata_sanbenedetto", 2),         # 2 medio
+    terna("coca_classic", "coca_zero", "pepsi_classic", 2)              # 3 difficile: unica senza zucchero
   ),
-  
   # ---- LISTA 2 ----
   list(
-    terna("fanta", "coca_zero", "pepsi_classic", 1),           # 1 facile
-    terna("sprite", "pepsi_classic", "cedrata", 2),            # 2 facile
-    terna("estathe_limone", "sanbenedetto_te", "coop_cola", 3),# 3 medio-facile
-    terna("conad_orange", "estathe_pesca", "estathe_limone", 1), # 4 medio
-    terna("conad_cola", "sprite", "coop_cola", 2),             # 5 medio
-    terna("pepsi_classic", "coca_classic", "chinotto", 3),     # 6 medio-difficile
-    terna("fanta", "conad_orange", "fanta_zero", 3),           # 7 Difficile: Unica senza zucchero
-    terna("coca_classic", "coca_zero", "pepsi_zero", 1),       # 8 Molto Difficile: Unica con zucchero
-    terna("sprite", "7up", "fanta", 3),                        # 9 Estremo: Intruso cromatico/gusto
-    terna("coca_zero", "pepsi_zero", "coca_classic", 3)        # 10 Il Boss: Unica con zucchero
+    terna("coca_zero", "fanta", "pepsi_classic", 2),                    # 1 facile
+    terna("sprite", "consilia_cola", "conad_cola", 1),                  # 2 medio
+    terna("fanta", "sanpellegrino_aranciata", "fanta_zero", 2)          # 3 difficile: unica non Fanta
   ),
-  
   # ---- LISTA 3 ----
   list(
-    terna("gatorade", "powerade", "fanta", 3),                 # 1 facile
-    terna("cedrata", "fanta", "conad_orange", 1),              # 2 facile
-    terna("estathe_pesca", "coca_zero", "sanbenedetto_te", 2), # 3 medio-facile
-    terna("sprite", "cedrata", "chinotto", 3),                 # 4 medio
-    terna("conad_cola", "coca_zero", "sprite", 3),             # 5 medio
-    terna("chinotto", "coca_zero", "coop_cola", 1),            # 6 medio-difficile
-    terna("sprite", "7up", "cedrata", 3),                      # 7 Difficile: Unica non Lemon-Lime
-    terna("coop_cola", "conad_cola", "pepsi_classic", 3),      # 8 Molto diff: Unica di Marca
-    terna("coca_classic", "coca_zero", "pepsi_classic", 3),    # 9 Estremo: L'unica Pepsi
-    terna("pepsi_classic", "pepsi_zero", "coca_zero", 1)       # 10 Il Boss: Unica con zucchero
+    terna("gatorade", "powerade", "fanta", 3),                          # 1 facile
+    terna("estathe_pesca", "coca_zero", "sanbenedetto_te", 2),          # 2 medio
+    terna("cedrata_sanbenedetto", "sprite", "7up", 1)                   # 3 difficile: unica non Lemon-Lime
+  ),
+  # ---- LISTA 4 ----
+  list(
+    terna("cedrata_sanbenedetto", "fanta", "conad_orange", 1),          # 1 facile
+    terna("pepsi_classic", "coca_classic", "chinotto", 3),              # 2 medio
+    terna("consilia_cola", "pepsi_classic", "conad_cola", 2)            # 3 difficile: unica di marca
+  ),
+  # ---- LISTA 5 ----
+  list(
+    terna("estathe_limone", "sanbenedetto_te", "consilia_cola", 3),     # 1 facile
+    terna("chinotto", "coca_zero", "conad_cola", 1),                    # 2 medio
+    terna("coca_classic", "coca_zero", "pepsi_zero", 1)                 # 3 difficile: unica con zucchero
+  ),
+  # ---- LISTA 6 ----
+  list(
+    terna("sprite", "pepsi_classic", "cedrata_sanbenedetto", 2),        # 1 facile
+    terna("conad_orange", "estathe_pesca", "estathe_limone", 1),        # 2 medio
+    terna("estathe_limone", "estathe_pesca", "sanbenedetto_te", 3)      # 3 difficile: unica non Estathé
+  ),
+  # ---- LISTA 7 ----
+  list(
+    terna("estathe_pesca", "powerade", "gatorade", 1),                  # 1 facile
+    terna("coca_zero", "pepsi_zero", "fanta_zero", 3),                  # 2 medio
+    terna("coca_classic", "conad_cola", "pepsi_classic", 2)             # 3 difficile: unica sottomarca
+  ),
+  # ---- LISTA 8 ----
+  list(
+    terna("pepsi_zero", "gatorade", "coca_zero", 2),                    # 1 facile
+    terna("fanta", "sanpellegrino_aranciata", "7up", 3),                # 2 medio
+    terna("coca_classic", "coca_zero", "consilia_cola", 3)              # 3 difficile: unica non Coca-Cola
+  ),
+  # ---- LISTA 9 ----
+  list(
+    terna("fanta_zero", "estathe_limone", "fanta", 2),                  # 1 facile
+    terna("gatorade", "coca_classic", "powerade", 2),                   # 2 medio
+    terna("sprite", "7up", "fanta", 3)                                  # 3 difficile: intruso di gusto
+  ),
+  # ---- LISTA 10 ----
+  list(
+    terna("conad_cola", "sanpellegrino_aranciata", "coca_classic", 2),  # 1 facile
+    terna("sprite", "cedrata_sanbenedetto", "chinotto", 3),             # 2 medio
+    terna("estathe_limone", "sprite", "7up", 1)                         # 3 difficile: unica non gassata
   )
 )
+
+# MODALITÀ MISTA: 10 liste FISSE. In ogni lista il tipo di ogni domanda (2 o 3 bicchieri)
+# è già deciso qui sotto, non viene estratto a caso.
+LISTE_MIX <- list(
+  # ---- LISTA M1 ----
+  list(
+    coppia("pepsi_zero", "estathe_pesca", 2),                           # 1 facile
+    terna("pepsi_classic", "consilia_cola", "chinotto", 3),             # 2 medio
+    coppia("coca_classic", "conad_cola", 1)                             # 3 difficile: marca vs sottomarca
+  ),
+  # ---- LISTA M2 ----
+  list(
+    terna("fanta", "estathe_limone", "conad_orange", 2),                # 1 facile
+    coppia("7up", "cedrata_sanbenedetto", 2),                           # 2 medio
+    terna("consilia_cola", "conad_cola", "coca_zero", 3)                # 3 difficile: unica di marca
+  ),
+  # ---- LISTA M3 ----
+  list(
+    coppia("gatorade", "chinotto", 1),                                  # 1 facile
+    coppia("sanpellegrino_aranciata", "sprite", 1),                     # 2 medio
+    terna("conad_cola", "consilia_cola", "pepsi_classic", 3)            # 3 difficile: unica di marca
+  ),
+  # ---- LISTA M4 ----
+  list(
+    terna("fanta", "sanbenedetto_te", "estathe_pesca", 1),              # 1 facile
+    terna("sprite", "fanta_zero", "7up", 2),                            # 2 medio
+    coppia("fanta_zero", "conad_orange", 2)                             # 3 difficile: zero vs zuccherata
+  ),
+  # ---- LISTA M5 ----
+  list(
+    coppia("sanbenedetto_te", "7up", 1),                                # 1 facile
+    terna("chinotto", "pepsi_zero", "coca_zero", 1),                    # 2 medio
+    terna("fanta", "fanta_zero", "sanpellegrino_aranciata", 3)              # 3 difficile: unica non Fanta
+  ),
+  # ---- LISTA M6 ----
+  list(
+    terna("powerade", "pepsi_classic", "gatorade", 2),                  # 1 facile
+    coppia("pepsi_zero", "fanta_zero", 1),                              # 2 medio
+    coppia("pepsi_classic", "consilia_cola", 2)                         # 3 difficile: marca vs sottomarca
+  ),
+  # ---- LISTA M7 ----
+  list(
+    coppia("estathe_limone", "fanta", 1),                               # 1 facile
+    coppia("coca_zero", "7up", 2),                                      # 2 medio
+    terna("estathe_pesca", "sanbenedetto_te", "estathe_limone", 2)      # 3 difficile: unica non Estathé
+  ),
+  # ---- LISTA M8 ----
+  list(
+    terna("conad_cola", "pepsi_classic", "powerade", 3),                # 1 facile
+    terna("conad_orange", "sprite", "sanpellegrino_aranciata", 2),      # 2 medio
+    coppia("conad_orange", "sanpellegrino_aranciata", 1)                # 3 difficile: due aranciate
+  ),
+  # ---- LISTA M9 ----
+  list(
+    coppia("chinotto", "estathe_limone", 1),                            # 1 facile
+    terna("fanta", "7up", "sprite", 1),                                 # 2 medio
+    coppia("pepsi_zero", "coca_classic", 2)                             # 3 difficile: zero vs classica
+  ),
+  # ---- LISTA M10 ----
+  list(
+    terna("gatorade", "estathe_pesca", "sanbenedetto_te", 1),           # 1 facile
+    coppia("conad_cola", "chinotto", 2),                                # 2 medio
+    terna("consilia_cola", "conad_cola", "pepsi_zero", 3)               # 3 difficile: unica di marca
+  )
+)
+
+LISTE_PER_MODALITA <- list("2" = LISTE_2, "3" = LISTE_3, "mix" = LISTE_MIX)
+
+MODALITA_NOMI <- c("2"   = "Assaggio alla cieca (2 bicchieri)",
+                   "3"   = "Trova l'intruso (3 bicchieri)",
+                   "mix" = "Mista")
+
+# Prossima lista da usare per ogni modalità. Vive a livello di app (non di sessione):
+# tutte le partite la condividono. Si parte dalla lista 1, poi 2, 3... fino all'ultima e si ricomincia.
+# Si azzera se l'app viene riavviata.
+PROSSIMA <- new.env()
+PROSSIMA[["2"]]   <- 1
+PROSSIMA[["3"]]   <- 1
+PROSSIMA[["mix"]] <- 1
+
+etichetta_lista <- function(mode, lista) if (mode == "mix") paste0("M", lista) else as.character(lista)
+
+# Restituisce la lista da usare adesso e fa avanzare il contatore
+assegna_lista <- function(mode) {
+  l <- PROSSIMA[[mode]]
+  PROSSIMA[[mode]] <- if (l >= length(LISTE_PER_MODALITA[[mode]])) 1 else l + 1
+  l
+}
+
+# Riquadro "prossima lista" per la schermata finale: la modalità appena giocata in grassetto
+prossime_liste_ui <- function(mode_corrente) {
+  righe <- lapply(c("2", "3", "mix"), function(m) {
+    testo <- paste0(MODALITA_NOMI[[m]], ": Lista ", etichetta_lista(m, PROSSIMA[[m]]))
+    if (m == mode_corrente) {
+      tags$p(tags$strong(testo), style = "margin:3px 0; font-size:1.15em;")
+    } else {
+      tags$p(testo, style = "margin:3px 0; color:#555;")
+    }
+  })
+  div(style = "background:#e8f4fd; border-left:5px solid #007bff; padding:12px 15px; border-radius:10px; margin:15px 0;",
+      h4("🥤 Prossima lista da preparare"),
+      tagList(righe))
+}
 
 # Controllo delle liste all'avvio
 valida_liste <- function() {
   problemi <- character(0)
-  controlla <- function(nome, liste, n_bicchieri) {
-    if (length(liste) != 3) {
-      problemi <<- c(problemi, paste(nome, "- servono 3 liste"))
-    }
+  controlla <- function(nome, liste, n_ammessi) {
+    if (length(liste) < 1) problemi <<- c(problemi, paste(nome, "- nessuna lista"))
     for (l in seq_along(liste)) {
-      if (length(liste[[l]]) != 10) {
-        problemi <<- c(problemi, paste(nome, "- lista", l, ": servono 10 domande"))
+      if (length(liste[[l]]) != N_DOMANDE) {
+        problemi <<- c(problemi, paste(nome, "- lista", l, ": servono", N_DOMANDE, "domande"))
       }
       for (k in seq_along(liste[[l]])) {
         d <- liste[[l]][[k]]
-        ok_ids <- length(d$ids) == n_bicchieri && length(unique(d$ids)) == n_bicchieri &&
-          all(d$ids %in% bevande$id)
+        n <- length(d$ids)
+        ok_ids <- n %in% n_ammessi && length(unique(d$ids)) == n && all(d$ids %in% bevande$id)
         if (!ok_ids) {
           problemi <<- c(problemi, paste(nome, "- lista", l, "domanda", k, ": bevande sbagliate o ripetute"))
         }
-        if (!(d$risposta %in% seq_len(n_bicchieri))) {
+        if (!(d$risposta %in% seq_len(n))) {
           problemi <<- c(problemi, paste(nome, "- lista", l, "domanda", k, ": risposta fuori range"))
         }
       }
     }
   }
   controlla("Assaggio a 2 bicchieri", LISTE_2, 2)
-  controlla("Assaggio a 3 bicchieri", LISTE_3, 3)
+  controlla("Trova l'intruso a 3 bicchieri", LISTE_3, 3)
+  controlla("Modalità mista", LISTE_MIX, c(2, 3))
   if (length(problemi) > 0) message("ATTENZIONE liste domande:\n", paste(problemi, collapse = "\n"))
   invisible(problemi)
 }
 valida_liste()
 
-scegli_modalita <- function(mode) {
-  if (mode == "mix") sample(c(2, 3), 1) else as.numeric(mode)
+# Restituisce le bevande del turno nell'ordine fisso dei bicchieri A, B, C.
+# mode: "2", "3" oppure "mix"; il numero di bicchieri dipende dalla domanda della lista.
+genera_turno <- function(turno, mode, lista) {
+  d <- LISTE_PER_MODALITA[[mode]][[lista]][[turno]]
+  n <- length(d$ids)
+  list(modalita = n,
+       lista = lista,
+       lista_label = etichetta_lista(mode, lista),
+       turno = turno,
+       ids = d$ids,
+       correct_idx = d$risposta,
+       target = if (n == 2) nome_bev(d$ids[d$risposta]) else NULL)
 }
 
-# Restituisce le bevande del turno nell'ordine fisso dei bicchieri A, B, C
-genera_turno <- function(turno, modalita, lista) {
-  if (modalita == 3) {
-    d <- LISTE_3[[lista]][[turno]]
-    list(modalita = 3, lista = lista, turno = turno, ids = d$ids,
-         correct_idx = d$risposta, target = NULL)
-  } else {
-    d <- LISTE_2[[lista]][[turno]]
-    list(modalita = 2, lista = lista, turno = turno, ids = d$ids,
-         correct_idx = d$risposta, target = nome_bev(d$ids[d$risposta]))
-  }
-}
-
-# Scheda operatore
+# Scheda operatore: tutte le liste di tutte le modalità
 tabella_scheda_operatore <- function() {
   righe <- list()
-  for (l in seq_along(LISTE_2)) {
-    for (k in seq_along(LISTE_2[[l]])) {
-      d2 <- LISTE_2[[l]][[k]]
-      d3 <- LISTE_3[[l]][[k]]
-      righe[[length(righe) + 1]] <- data.frame(
-        Lista = l, Domanda = k, Bicchieri = 2,
-        "Bicchiere A" = nome_bev(d2$ids[1]),
-        "Bicchiere B" = nome_bev(d2$ids[2]),
-        "Bicchiere C" = "-",
-        "Risposta corretta" = paste0(LETTERS[d2$risposta], ": ", nome_bev(d2$ids[d2$risposta])),
-        check.names = FALSE, stringsAsFactors = FALSE
-      )
-      righe[[length(righe) + 1]] <- data.frame(
-        Lista = l, Domanda = k, Bicchieri = 3,
-        "Bicchiere A" = nome_bev(d3$ids[1]),
-        "Bicchiere B" = nome_bev(d3$ids[2]),
-        "Bicchiere C" = nome_bev(d3$ids[3]),
-        "Risposta corretta" = paste0("intruso ", LETTERS[d3$risposta], ": ", nome_bev(d3$ids[d3$risposta])),
-        check.names = FALSE, stringsAsFactors = FALSE
-      )
+  aggiungi <- function(modalita_nome, liste, prefisso) {
+    for (l in seq_along(liste)) {
+      for (k in seq_along(liste[[l]])) {
+        d <- liste[[l]][[k]]
+        n <- length(d$ids)
+        corretta <- nome_bev(d$ids[d$risposta])
+        righe[[length(righe) + 1]] <<- data.frame(
+          "Modalità" = modalita_nome,
+          Lista = paste0(prefisso, l),
+          Domanda = k,
+          Bicchieri = n,
+          "Bicchiere A" = nome_bev(d$ids[1]),
+          "Bicchiere B" = nome_bev(d$ids[2]),
+          "Bicchiere C" = if (n == 3) nome_bev(d$ids[3]) else "-",
+          "Risposta corretta" = if (n == 3) {
+            paste0("intruso ", LETTERS[d$risposta], ": ", corretta)
+          } else {
+            paste0(LETTERS[d$risposta], ": ", corretta)
+          },
+          check.names = FALSE, stringsAsFactors = FALSE
+        )
+      }
     }
   }
+  aggiungi(MODALITA_NOMI[["2"]], LISTE_2, "")
+  aggiungi(MODALITA_NOMI[["3"]], LISTE_3, "")
+  aggiungi(MODALITA_NOMI[["mix"]], LISTE_MIX, "M")
   do.call(rbind, righe)
 }
 
@@ -397,47 +542,7 @@ probabilita_utente <- function(mod, eta, freq) {
   as.numeric(predict(mod$fit, newdata = nd, type = "prob")[1, "Si"])
 }
 
-# Curva ROC sulle probabilità out-of-bag (ogni risposta valutata senza usarla per addestrare)
-curva_roc <- function(mod) {
-  prob <- mod$fit$votes[, "Si"]
-  pROC::roc(mod$data$y, prob, levels = c("No", "Si"), direction = "<", quiet = TRUE)
-}
-
-# --- 7. CLASSIFICA -----------------------------------------------------------
-# Per ogni partecipante: miglior punteggio tra le partite complete (10 risposte)
-classifica_df <- function(dati) {
-  d <- dati[!is.na(dati$id_partita) & nzchar(dati$id_partita) &
-              !is.na(dati$nickname) & nzchar(dati$nickname), , drop = FALSE]
-  if (nrow(d) == 0) return(NULL)
-  
-  # una riga per partita: nickname, risposte date, risposte corrette
-  partite <- do.call(rbind, lapply(split(d, d$id_partita), function(p) {
-    data.frame(nickname = p$nickname[1], risposte = nrow(p),
-               corrette = sum(p$corretto), stringsAsFactors = FALSE)
-  }))
-  partite <- partite[partite$risposte == 10, , drop = FALSE]   # solo partite complete
-  if (nrow(partite) == 0) return(NULL)
-  
-  # una riga per partecipante: miglior punteggio e numero di partite complete
-  utenti <- do.call(rbind, lapply(split(partite, partite$nickname), function(u) {
-    data.frame(nickname = u$nickname[1], punteggio = max(u$corrette),
-               partite = nrow(u), stringsAsFactors = FALSE)
-  }))
-  utenti <- utenti[order(-utenti$punteggio, utenti$nickname), , drop = FALSE]
-  
-  cl <- data.frame(
-    Posto = rank(-utenti$punteggio, ties.method = "min"),
-    Nickname = utenti$nickname,
-    "Miglior punteggio (su 10)" = utenti$punteggio,
-    "Partite complete" = utenti$partite,
-    check.names = FALSE,
-    stringsAsFactors = FALSE
-  )
-  rownames(cl) <- NULL
-  cl
-}
-
-# --- 8. INTERFACCIA UTENTE ---------------------------------------------------
+# --- 7. INTERFACCIA UTENTE ---------------------------------------------------
 ui <- fluidPage(
   useShinyjs(),
   
@@ -449,6 +554,25 @@ ui <- fluidPage(
           confetti({ particleCount: 100, spread: 70, origin: { y: 0.6 } });
         }
       });
+
+      // Conteggio animato della probabilità: da 0 al valore finale
+      window.animaProbabilita = function() {
+        $('.prob-numero').each(function() {
+          var el = $(this);
+          var target = parseFloat(el.attr('data-target'));
+          if (isNaN(target)) { return; }
+          var inizio = null;
+          var durata = 1800;
+          function passo(ts) {
+            if (inizio === null) { inizio = ts; }
+            var p = Math.min((ts - inizio) / durata, 1);
+            var ease = 1 - Math.pow(1 - p, 3);
+            el.text(Math.round(target * ease) + '%');
+            if (p < 1) { requestAnimationFrame(passo); }
+          }
+          requestAnimationFrame(passo);
+        });
+      };
     ")),
     tags$style(HTML("
       body {
@@ -479,7 +603,7 @@ ui <- fluidPage(
       }
       .panel-small { max-width: 680px; width: 90%; margin-top: 80px; }
       .panel-large { max-width: 1100px; width: 95%; margin: 80px auto 20px auto; }
-      .panel-dashboard { max-width: 1200px; width: 95%; margin: 80px auto; }
+      .panel-dashboard { max-width: 1000px; width: 95%; margin: 80px auto; }
       .drink-card-img {
         width: 100%;
         height: 260px;
@@ -491,6 +615,43 @@ ui <- fluidPage(
         transition: transform 0.2s ease;
       }
       .drink-card-img:hover { transform: scale(1.03); }
+
+      /* --- Probabilità di indovinare: grande, pulsante e lampeggiante --- */
+      .prob-box {
+        text-align: center;
+        color: white;
+        padding: 30px 20px;
+        border-radius: 24px;
+        margin: 10px 0 20px 0;
+        box-shadow: 0 0 25px rgba(0,0,0,0.25);
+        animation: probPulse 1.3s ease-in-out infinite, probEntra 0.6s ease-out;
+      }
+      .prob-alta  { background: linear-gradient(135deg, #11998e, #38ef7d); }
+      .prob-media { background: linear-gradient(135deg, #f12711, #f5af19); }
+      .prob-bassa { background: linear-gradient(135deg, #b31217, #e52d27); }
+      .prob-titolo { font-size: 26px; font-weight: 800; }
+      .prob-nome   { font-size: 20px; font-weight: 600; opacity: 0.95; min-height: 24px; }
+      .prob-numero {
+        font-size: 110px;
+        font-weight: 900;
+        line-height: 1.05;
+        text-shadow: 0 0 18px rgba(255,255,255,0.85), 0 4px 10px rgba(0,0,0,0.3);
+        animation: probLampeggia 0.9s steps(1, end) 4;
+      }
+      .prob-nota { font-size: 14px; opacity: 0.9; margin-top: 8px; }
+      @keyframes probPulse {
+        0%, 100% { transform: scale(1);     box-shadow: 0 0 0 0 rgba(255,255,255,0.55); }
+        50%      { transform: scale(1.025); box-shadow: 0 0 35px 14px rgba(255,255,255,0); }
+      }
+      @keyframes probLampeggia {
+        0%, 100% { opacity: 1; }
+        50%      { opacity: 0.2; }
+      }
+      @keyframes probEntra {
+        from { transform: scale(0.7); opacity: 0; }
+        to   { transform: scale(1);   opacity: 1; }
+      }
+
       @media print {
         body { background: white !important; }
         #menu_button, #menu_dropdown, .no-print, .shiny-notification { display: none !important; }
@@ -509,7 +670,7 @@ ui <- fluidPage(
     tags$div(
       id = "menu_dropdown",
       style = "display:none; position:absolute; right:0; background-color: rgba(255,255,255,0.95); border-radius: 8px; margin-top:5px; padding:5px; min-width:180px; box-shadow: 0px 4px 8px rgba(0,0,0,0.2);",
-      actionButton("go_dashboard_menu", "📊 Classifica & IA", style = "width:100%; border:none; background:none; text-align:left; padding:8px;"),
+      actionButton("go_dashboard_menu", "📊 Dashboard IA", style = "width:100%; border:none; background:none; text-align:left; padding:8px;"),
       actionButton("go_tree_menu", "🌳 Albero Tassonomico", style = "width:100%; border:none; background:none; text-align:left; padding:8px;"),
       actionButton("go_operatore", "🔒 Scheda operatore", style = "width:100%; border:none; background:none; text-align:left; padding:8px;")
     )
@@ -533,7 +694,7 @@ ui <- fluidPage(
   uiOutput("main_ui")
 )
 
-# --- 9. LOGICA SERVER --------------------------------------------------------
+# --- 8. LOGICA SERVER --------------------------------------------------------
 server <- function(input, output, session) {
   
   rv <- reactiveValues(
@@ -607,7 +768,7 @@ server <- function(input, output, session) {
           radioButtons("mode_select", "🎯 Scegli la modalità del gioco:",
                        choices = c("Trova l'Intruso (3 Bicchieri)" = "3",
                                    "Assaggio alla Cieca (2 Bicchieri)" = "2",
-                                   "Mista / Alternata (Casuale)" = "mix"),
+                                   "Mista (2 e 3 Bicchieri alternati)" = "mix"),
                        selected = "3"),
           
           actionButton("start_game", "🚀 Inizia il gioco", class = "btn-primary btn-lg",
@@ -624,7 +785,7 @@ server <- function(input, output, session) {
       wellPanel(
         class = "panel-large",
         div(style = "text-align:center;",
-            h3(paste0("Lista ", curr$lista, " · Domanda #", game$turn, " di 10")),
+            h3(paste0("Lista ", curr$lista_label, " · Domanda #", game$turn, " di ", N_DOMANDE)),
             h4(if (n == 3) "Trova l'Intruso (3 Bicchieri): quale bicchiere è l'intruso?"
                else paste0("Assaggio alla Cieca (2 Bicchieri): quale dei due bicchieri è ", curr$target, "?"))),
         br(),
@@ -706,25 +867,23 @@ server <- function(input, output, session) {
         plotOutput("turn_tree_plot", height = "480px"),
         div(style = "text-align:center; margin-top:20px;",
             actionButton("continue_after_tree",
-                         if (game$turn == 10) "Vai ai risultati finali 🎉" else "Continua ➡️",
+                         if (game$turn == N_DOMANDE) "Vai ai risultati finali 🎉" else "Continua ➡️",
                          class = "btn-primary btn-lg",
                          style = "font-size:18px; padding:10px 40px;"))
       )
       
-      # --- 4. FINE PARTITA: punteggio e classifica ---
+      # --- 4. FINE PARTITA: solo punteggio e pulsanti ---
     } else if (game$stage %in% c("lose", "win")) {
       wellPanel(
         class = "panel-small",
-        h2(if (game$stage == "win") "Perfetto! 🎉" else "Partita Completata!"),
-        h3(paste("Punteggio:", game$correct, "/ 10")),
-        uiOutput("posto_utente"),
-        h4("🏆 Classifica di tutti i partecipanti"),
-        tableOutput("tabella_classifica"),
+        h2(if (game$stage == "win") "Ottimo lavoro! 🎉" else "Partita completata!"),
+        h3(paste0("Punteggio: ", game$correct, " / ", N_DOMANDE)),
+        prossime_liste_ui(game$mode),
         br(),
         div(style = "text-align:center;",
             actionButton("go_tree_dashboard", "🌳 Albero finale", class = "btn-info btn-lg",
                          style = "font-size:16px; padding:10px 25px; margin:5px;"),
-            actionButton("go_leaderboard", "📊 Dashboard & IA", class = "btn-primary btn-lg",
+            actionButton("go_dashboard", "📊 Dashboard IA", class = "btn-primary btn-lg",
                          style = "font-size:16px; padding:10px 25px; margin:5px;"),
             actionButton("restart", "🔄 Nuova partita", class = "btn-warning btn-lg",
                          style = "font-size:16px; padding:10px 25px; margin:5px;"))
@@ -737,35 +896,26 @@ server <- function(input, output, session) {
         h2("Il tuo percorso nella Tassonomia delle Bibite 🌳"),
         plotOutput("final_tree", height = "480px"),
         div(style = "text-align:center; margin-top:20px;",
-            actionButton("go_leaderboard", "📊 Classifica & Dashboard IA", class = "btn-primary btn-lg",
+            actionButton("go_dashboard", "📊 Dashboard IA", class = "btn-primary btn-lg",
                          style = "font-size:16px; padding:10px 25px;"))
       )
       
-      # --- 6. CLASSIFICA & DASHBOARD IA ---
+      # --- 6. DASHBOARD IA: probabilità di indovinare + ultime risposte ---
     } else if (game$stage == "dashboard") {
       wellPanel(
         class = "panel-dashboard",
-        h2("📊 Classifica & Dashboard IA"),
+        h2("📊 Dashboard IA"),
         p(style = "font-size:0.9em; color:#555;", paste("Salvataggio risposte:", STATO_SALVATAGGIO)),
-        fluidRow(
-          column(6,
-                 h4("🏆 Classifica"),
-                 tableOutput("tabella_classifica"),
-                 br(),
-                 actionButton("aggiorna", "🔄 Aggiorna dati", class = "btn-secondary")),
-          column(6,
-                 h4("🤖 Modello IA (Random Forest)"),
-                 uiOutput("predizione_realtime_ui"),
-                 br(),
-                 h4("📈 Curva ROC"),
-                 plotOutput("roc_combined", height = "300px"))
-        ),
+        uiOutput("predizione_realtime_ui"),
         hr(),
         h4("📋 Ultime risposte registrate"),
         tableOutput("tabella_risposte"),
-        hr(),
-        actionButton("restart", "🔄 Nuova partita", class = "btn-warning btn-lg",
-                     style = "font-size:16px; padding:10px 30px;")
+        br(),
+        div(style = "text-align:center;",
+            actionButton("aggiorna", "🔄 Aggiorna dati", class = "btn-secondary btn-lg",
+                         style = "font-size:16px; padding:10px 25px; margin:5px;"),
+            actionButton("restart", "🔄 Nuova partita", class = "btn-warning btn-lg",
+                         style = "font-size:16px; padding:10px 25px; margin:5px;"))
       )
       
       # --- 7. SCHEDA OPERATORE (riservata, con PIN) ---
@@ -808,14 +958,15 @@ server <- function(input, output, session) {
     game$maratona_ny <- if (!is.null(input$maratona_ny) && input$maratona_ny != "") input$maratona_ny else "Non specificato"
     game$sabato_sera <- if (!is.null(input$sabato_sera) && input$sabato_sera != "") input$sabato_sera else "Non specificato"
     game$mode <- input$mode_select
-    game$lista <- sample(1:3, 1)
+    # la lista è la "prossima" della modalità scelta (si procede in ordine, vedi PROSSIMA)
+    game$lista <- assegna_lista(game$mode)
     game$turn <- 1
     game$correct <- 0
     
     rv$visti <- character(0)
     rv$esito <- character(0)
     
-    game$current <- genera_turno(1, scegli_modalita(game$mode), game$lista)
+    game$current <- genera_turno(1, game$mode, game$lista)
     rv$visti <- unique(c(rv$visti, game$current$ids))
     game$choice_made <- FALSE
     game$selected <- NULL
@@ -856,13 +1007,13 @@ server <- function(input, output, session) {
         maratona_ny = game$maratona_ny,
         sabato_sera = game$sabato_sera,
         turno = game$turn,
-        modalita = curr$modalita,
+        modalita = curr$modalita,          # numero di bicchieri della domanda (2 o 3)
         bevanda_giusta = id_giusto,
         bevanda_scelta = id_scelto,
         scelta = paste0("Opzione_", i),
         corretto = is_correct,
         id_partita = game$id,
-        lista = curr$lista,
+        lista = curr$lista_label,          # "1".."10" per 2 e 3 bicchieri, "M1".."M10" per la mista
         stringsAsFactors = FALSE
       )
       
@@ -877,12 +1028,12 @@ server <- function(input, output, session) {
   observeEvent(input$view_step_tree, { game$stage <- "turn_tree" })
   
   observeEvent(input$continue_after_tree, {
-    if (game$turn == 10) {
-      rv$aggiornamento <- rv$aggiornamento + 1   # rilegge le risposte per la classifica
-      game$stage <- if (game$correct >= 6) "win" else "lose"
+    if (game$turn == N_DOMANDE) {
+      rv$aggiornamento <- rv$aggiornamento + 1   # rilegge le risposte per la dashboard
+      game$stage <- if (game$correct >= SOGLIA_VITTORIA) "win" else "lose"
     } else {
       game$turn <- game$turn + 1
-      game$current <- genera_turno(game$turn, scegli_modalita(game$mode), game$lista)
+      game$current <- genera_turno(game$turn, game$mode, game$lista)
       rv$visti <- unique(c(rv$visti, game$current$ids))
       game$choice_made <- FALSE
       game$selected <- NULL
@@ -891,7 +1042,7 @@ server <- function(input, output, session) {
   })
   
   observeEvent(input$go_tree_dashboard, { game$stage <- "tree_dashboard" })
-  observeEvent(input$go_leaderboard, { game$stage <- "dashboard" })
+  observeEvent(input$go_dashboard, { game$stage <- "dashboard" })
   observeEvent(input$go_dashboard_menu, { game$stage <- "dashboard"; shinyjs::hide("menu_dropdown") })
   observeEvent(input$go_tree_menu, { game$stage <- "tree_dashboard"; shinyjs::hide("menu_dropdown") })
   observeEvent(input$restart, { game$stage <- "start" })
@@ -926,7 +1077,8 @@ server <- function(input, output, session) {
       return(NULL)
     }
     p(tags$strong("In gioco adesso: "),
-      paste0("Lista ", curr$lista, ", domanda #", game$turn, " (", curr$modalita, " bicchieri)"))
+      paste0(MODALITA_NOMI[[game$mode]], ", Lista ", curr$lista_label,
+             ", domanda #", game$turn, " (", curr$modalita, " bicchieri)"))
   })
   
   output$tabella_operatore <- renderTable({
@@ -944,38 +1096,7 @@ server <- function(input, output, session) {
     plot_albero(rv$visti, rv$esito, size = 6)
   })
   
-  # Posizione del giocatore in classifica
-  output$posto_utente <- renderUI({
-    dg <- dati_globali()
-    if (!is.null(dg$errore)) {
-      return(div(style = "color:#721c24;", paste("Classifica non disponibile:", dg$errore)))
-    }
-    cl <- classifica_df(dg$dati)
-    if (is.null(cl) || is.null(game$nickname)) return(NULL)
-    pos <- cl$Posto[match(game$nickname, cl$Nickname)]
-    if (is.na(pos)) return(p("La tua partita non risulta ancora in classifica."))
-    h4(paste0("Sei al posto ", pos, " su ", nrow(cl), " partecipanti"))
-  })
-  
-  output$tabella_classifica <- renderTable({
-    dg <- dati_globali()
-    if (!is.null(dg$errore)) {
-      return(data.frame(Messaggio = paste("Dati non disponibili:", dg$errore)))
-    }
-    cl <- classifica_df(dg$dati)
-    if (is.null(cl)) {
-      d <- dg$dati
-      senza_id <- nrow(d) > 0 && all(is.na(d$id_partita))
-      msg <- if (senza_id) {
-        "Nel foglio manca la colonna id_partita: vedi le istruzioni."
-      } else {
-        "Nessuna partita completa ancora."
-      }
-      return(data.frame(Messaggio = msg))
-    }
-    cl
-  }, striped = TRUE, bordered = TRUE, hover = TRUE)
-  
+  # Probabilità di indovinare: grande, colorata, pulsante e lampeggiante
   output$predizione_realtime_ui <- renderUI({
     mod <- modello()
     if (!isTRUE(mod$ok)) {
@@ -986,29 +1107,18 @@ server <- function(input, output, session) {
       return(div(style = "background:#fff3cd; padding:12px; border-radius:10px;",
                  "Inserisci età e consumo di bibite per vedere la predizione."))
     }
+    perc <- round(p_si * 100)
+    classe <- if (perc >= 66) "prob-alta" else if (perc >= 33) "prob-media" else "prob-bassa"
     nick <- if (is.null(game$nickname)) "" else game$nickname
-    div(style = "background-color:#f0f8ff; padding:15px; border-radius:10px; border-left: 5px solid #007bff;",
-        h5("🚀 Predizione Random Forest"),
-        HTML(paste0("Probabilità stimata per <b>", htmltools::htmlEscape(nick),
-                    "</b> di indovinare: <b>", round(p_si * 100, 1), "%</b>")),
-        tags$br(),
-        tags$small(paste0("Basato su ", mod$n, " risposte. Età ", game$eta,
-                          ", bibite gassate a settimana: ", game$freq, ".")))
-  })
-  
-  output$roc_combined <- renderPlot({
-    mod <- modello()
-    tryCatch({
-      if (!isTRUE(mod$ok)) stop(mod$msg)
-      roc_obj <- curva_roc(mod)
-      plot(roc_obj, col = "#28a745", lwd = 2.5, main = "Curva ROC - Random Forest")
-      abline(0, 1, lty = 2, col = "gray")
-      legend("bottomright", legend = paste("AUC =", round(as.numeric(pROC::auc(roc_obj)), 2)),
-             col = "#28a745", lwd = 2.5, bty = "n")
-    }, error = function(e) {
-      plot.new()
-      text(0.5, 0.5, paste(strwrap(e$message, 45), collapse = "\n"), cex = 0.9, col = "#721c24")
-    })
+    
+    div(class = paste("prob-box", classe),
+        div(class = "prob-titolo", "🚀 Probabilità di indovinare"),
+        div(class = "prob-nome", if (nzchar(nick)) paste0("per ", nick)),
+        div(class = "prob-numero", `data-target` = perc, paste0(perc, "%")),
+        div(class = "prob-nota",
+            paste0("Random Forest su ", mod$n, " risposte · età ", game$eta,
+                   " · bibite gassate a settimana: ", game$freq)),
+        tags$script("animaProbabilita();"))
   })
   
   output$tabella_risposte <- renderTable({
